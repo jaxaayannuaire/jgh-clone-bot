@@ -1,0 +1,48 @@
+# --- Secrets (JAMAIS sur GitHub) ---
+.env
+*.env
+!.env.example
+
+# --- Base de données locale ---
+*.duckdb
+*.duckdb.wal
+clone.duckdb
+
+# --- Clés et certificats ---
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+deploy_*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+
+# --- Artefacts de packs (produits par publish_pack.py, ne pas versionner) ---
+pack-*-v*/
+*.sql
+!db/schema.sql
+custom_*.tar.gz
+documents_*.tar.gz
+pack_*.tar.gz
+
+# --- Logs ---
+*.log
+
+# --- OS / éditeurs ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
