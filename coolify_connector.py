@@ -158,15 +158,33 @@ class CoolifyConnector:
 
     @staticmethod
     def _extract_error_detail(resp: requests.Response) -> str:
-        """Coolify renvoie parfois {message:...}, parfois {error:...}, parfois du texte."""
+        """
+        Coolify renvoie selon le cas {message:...}, {error:...}, ou sur un 422
+        un {message:..., errors:{champ:[raisons]}}. On déplie `errors` pour
+        rendre visible le champ fautif — sans lui, un 422 est indébogable.
+        """
         try:
             body = resp.json()
         except ValueError:
             return resp.text[:300] or "(corps vide)"
         if isinstance(body, dict):
-            for key in ("message", "error", "errors"):
-                if key in body:
-                    return str(body[key])
+            parts: list[str] = []
+            if body.get("message"):
+                parts.append(str(body["message"]))
+            # Détail par champ (validation Laravel : {champ: [raison, ...]})
+            errors = body.get("errors")
+            if isinstance(errors, dict):
+                for field, reasons in errors.items():
+                    if isinstance(reasons, (list, tuple)):
+                        parts.append(f"{field}: {'; '.join(map(str, reasons))}")
+                    else:
+                        parts.append(f"{field}: {reasons}")
+            elif errors:
+                parts.append(str(errors))
+            if not parts and body.get("error"):
+                parts.append(str(body["error"]))
+            if parts:
+                return " | ".join(parts)
         return str(body)[:300]
 
     # -- Lectures (permission read) -----------------------------------------
@@ -202,7 +220,8 @@ class CoolifyConnector:
         git_repository: str,          # ex: git@github.com:jaxaayannuaire/jgh-pack-pos.git
         git_branch: str,              # ex: "main" (le checkout du tag se gère en amont)
         private_key_uuid: str,        # deploy key Coolify du repo du pack
-        domain: str,                  # ex: client1pos.yessalerp.com
+        domain: str,                  # ex: client1pos.yessalerp.com (sans schéma)
+        compose_service_name: str = "dolib",  # nom du service dans le compose
         docker_compose_location: str = "/docker-compose.yml",
         instant_deploy: bool = False,
         force_domain_override: bool = False,
@@ -211,6 +230,17 @@ class CoolifyConnector:
         Crée une application Coolify à partir d'un repo Git privé contenant
         un docker-compose.yml (voie hybride confirmée).
 
+        IMPORTANT (écart 4.1.2 validé contre l'instance réelle) : en mode
+        dockercompose, le champ `domains` plat est REFUSÉ (422). Il faut
+        `docker_compose_domains`, un TABLEAU D'OBJETS {name, domain} où :
+          - name   = nom du service dans le docker-compose.yml qui porte le domaine
+          - domain = domaine complet avec schéma (https://...)
+        Coolify valide que `name` existe bien comme service du compose.
+
+        CONVENTION D'ARTEFACT : le service applicatif principal de tous les packs
+        s'appelle `dolib` (compose_service_name par défaut). Tous les
+        docker-compose.yml de packs DOIVENT déclarer un service de ce nom.
+
         force_domain_override=False → l'API renvoie 409 si le domaine est déjà
         pris, remonté en CoolifyDomainConflict (jamais d'écrasement silencieux).
 
@@ -218,6 +248,9 @@ class CoolifyConnector:
         l'injection des variables DOLI_* AVANT le premier boot (set_envs_bulk).
         Le bot enchaîne : create → set_envs_bulk → deploy.
         """
+        # docker_compose_domains attend des URLs avec schéma.
+        fqdn = domain if domain.startswith(("http://", "https://")) else f"https://{domain}"
+
         payload = {
             "project_uuid": self.cfg.project_uuid,
             "server_uuid": self.cfg.server_uuid,
@@ -229,12 +262,14 @@ class CoolifyConnector:
             "private_key_uuid": private_key_uuid,
             "build_pack": "dockercompose",
             "docker_compose_location": docker_compose_location,
-            "domains": domain,
+            "docker_compose_domains": [
+                {"name": compose_service_name, "domain": fqdn}
+            ],
             "instant_deploy": instant_deploy,
             "force_domain_override": force_domain_override,
         }
-        logger.info("Création app Compose '%s' (repo=%s, domaine=%s)",
-                    name, git_repository, domain)
+        logger.info("Création app Compose '%s' (repo=%s, service=%s, domaine=%s)",
+                    name, git_repository, compose_service_name, fqdn)
         return self._request("POST", "applications/private-deploy-key", payload)
 
     # -- Variables d'environnement (remplace le sed sur conf.php) -----------
