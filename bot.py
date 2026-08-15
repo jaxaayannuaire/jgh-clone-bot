@@ -91,6 +91,14 @@ PACKS: dict[str, dict] = {
 
 DEFAULT_PACK = os.environ.get("DEFAULT_PACK", "pos")
 
+# --- Suivi de déploiement (notification de fin) ---
+# Intervalle entre deux vérifications de l'état du déploiement.
+POLL_INTERVAL_S = int(os.environ.get("POLL_INTERVAL_S", "15"))
+# Délai maximal de suivi ; au-delà, on prévient sans conclure (⚠️).
+POLL_TIMEOUT_S = int(os.environ.get("POLL_TIMEOUT_S", str(12 * 60)))
+# Version de Dolibarr des packs (affichée dans le message de fin).
+DOLIBARR_VERSION = os.environ.get("DOLIBARR_VERSION", "22.0.4")
+
 
 def is_allowed(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
@@ -352,16 +360,136 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ App créée mais déploiement échoué (job #{job_id}) : {e}")
         return
 
-    # 3. Statut actif (le déploiement continue en arrière-plan côté Coolify)
-    db.set_job_status(job_id, "active", resolved=True,
-                      append_log="statut actif")
+    # 3. Déploiement déclenché → on lance le SUIVI en tâche de fond.
+    #    Le job reste 'running' ; le polling le passera à 'active' (succès)
+    #    ou 'failed' (échec), et enverra le message de fin riche.
+    db.set_job_status(job_id, "running", append_log="suivi du déploiement lancé")
+
     await query.edit_message_text(
-        f"✅ *Déploiement lancé* (job #{job_id})\n\n"
+        f"⏳ *Déploiement en cours* (job #{job_id})\n\n"
+        f"Client : `{job['client_name']}`\n"
         f"App : `{app_name}`\n"
         f"URL : https://{job['subdomain']}/\n\n"
-        f"Le premier déploiement prend 2–6 min (téléchargement des images).\n"
-        f"Suivi : /job {job_id}",
+        f"Téléchargement des images et démarrage… "
+        f"Je te préviens dès que c'est prêt.\n"
+        f"Suivi manuel : /job {job_id}",
         parse_mode="Markdown")
+
+    # Planifier le polling non bloquant (le bot reste réactif).
+    chat_id = query.message.chat_id
+    context.job_queue.run_once(
+        poll_deployment,
+        when=POLL_INTERVAL_S,
+        data={
+            "job_id": job_id,
+            "app_uuid": app_uuid,
+            "app_name": app_name,
+            "domain": job["subdomain"],
+            "chat_id": chat_id,
+            "started_at": time.time(),
+            "attempts": 0,
+        },
+        name=f"poll_job_{job_id}",
+    )
+
+
+def _human_duration(seconds: float) -> str:
+    """Formate une durée en 'X min Y s' (ou 'Y s' si < 1 min)."""
+    s = int(round(seconds))
+    m, s = divmod(s, 60)
+    return f"{m} min {s} s" if m else f"{s} s"
+
+
+async def poll_deployment(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Tâche de fond (job_queue) : suit un déploiement jusqu'à sa fin.
+
+    Logique validée contre Coolify 4.1.2 :
+      - tant que le déploiement figure dans /deployments (in_progress) → on
+        replanifie une vérification dans POLL_INTERVAL_S ;
+      - dès qu'il disparaît de /deployments → le déploiement est terminé ;
+        on lit alors l'état de l'app : running = ✅ succès, sinon 🔴 échec ;
+      - au-delà de POLL_TIMEOUT_S → ⚠️ on prévient sans conclure.
+
+    Le message de fin s'inspire de l'e-mail d'installation OVH : statut,
+    paramètres d'accès, et liens (dont /job détaillé).
+    """
+    data = context.job.data
+    job_id = data["job_id"]
+    app_uuid = data["app_uuid"]
+    app_name = data["app_name"]
+    domain = data["domain"]
+    chat_id = data["chat_id"]
+    started_at = data["started_at"]
+    attempts = data["attempts"] + 1
+
+    db: Database = context.bot_data["db"]
+    conn: CoolifyConnector = context.bot_data["coolify"]
+
+    elapsed = time.time() - started_at
+
+    # 1. Toujours en cours ? (présent dans /deployments)
+    try:
+        still_active = conn.is_deployment_active(
+            app_uuid=app_uuid, app_name=app_name)
+    except CoolifyError as e:
+        # Erreur API transitoire : on ne conclut pas, on retente au prochain tour
+        logger.warning("poll job #%d : erreur API (%s), on retente", job_id, e)
+        still_active = True
+
+    if still_active:
+        # 2. Dépassement du délai maximal ?
+        if elapsed >= POLL_TIMEOUT_S:
+            db.set_job_status(
+                job_id, "running",
+                append_log=f"timeout suivi après {_human_duration(elapsed)}")
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ *Déploiement toujours en cours* (job #{job_id})\n\n"
+                f"Après {_human_duration(elapsed)}, le déploiement n'est pas "
+                f"terminé. Il continue peut-être côté Coolify — vérifie "
+                f"manuellement.\n"
+                f"URL : https://{domain}/\n"
+                f"Détails : /job {job_id}",
+                parse_mode="Markdown")
+            return
+
+        # Sinon on replanifie une vérification
+        data["attempts"] = attempts
+        context.job_queue.run_once(
+            poll_deployment, when=POLL_INTERVAL_S, data=data,
+            name=f"poll_job_{job_id}")
+        return
+
+    # 3. Le déploiement a disparu de /deployments → terminé. Succès ou échec ?
+    running = conn.application_is_running(app_uuid)
+    duree = _human_duration(elapsed)
+
+    if running:
+        db.set_job_status(
+            job_id, "active", resolved=True,
+            append_log=f"déploiement réussi en {duree}")
+        await context.bot.send_message(
+            chat_id,
+            f"✅ *Instance déployée avec succès !* (job #{job_id})\n\n"
+            f"🌐 URL : https://{domain}/\n"
+            f"🐘 Dolibarr : {DOLIBARR_VERSION}\n"
+            f"⏱️ Déployée en {duree}\n\n"
+            f"🔗 Détails : /job {job_id}",
+            parse_mode="Markdown")
+    else:
+        db.set_job_status(
+            job_id, "failed",
+            error="L'application n'est pas 'running' après le déploiement",
+            append_log=f"échec constaté après {duree}", resolved=True)
+        await context.bot.send_message(
+            chat_id,
+            f"🔴 *Déploiement bloqué* (job #{job_id})\n\n"
+            f"L'application n'a pas démarré correctement après {duree}.\n"
+            f"URL prévue : https://{domain}/\n\n"
+            f"🔗 Diagnostic : /job {job_id}\n"
+            f"Vérifie les logs du déploiement dans Coolify.",
+            parse_mode="Markdown")
 
 
 async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -426,8 +554,17 @@ def main():
     app.add_handler(CommandHandler("job", cmd_job))
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^(ok|no):"))
 
-    logger.info("JGH Clone Bot démarré (allowed=%d, admins=%d)",
-                len(ALLOWED_IDS), len(ADMIN_IDS))
+    # Garde-fou : le suivi de déploiement repose sur job_queue, qui n'existe
+    # que si python-telegram-bot est installé avec l'extra [job-queue].
+    if app.job_queue is None:
+        logger.error(
+            "job_queue indisponible — installe 'python-telegram-bot[job-queue]'. "
+            "La notification de fin de déploiement ne fonctionnera pas.")
+    else:
+        logger.info("job_queue actif : notification de fin de déploiement OK.")
+
+    logger.info("JGH Clone Bot démarré (allowed=%d, admins=%d, packs=%d)",
+                len(ALLOWED_IDS), len(ADMIN_IDS), len(PACKS))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

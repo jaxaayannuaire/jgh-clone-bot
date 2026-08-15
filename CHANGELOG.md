@@ -3,6 +3,30 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.3.0] - 2026-08-15
+
+Notification automatique de fin de déploiement.
+
+### Added
+- Suivi de déploiement en tâche de fond (`job_queue`) : après un `/provision`,
+  le bot surveille l'avancement et envoie un message de fin sans blocage.
+- Message de fin inspiré de l'e-mail d'installation OVH : ✅ succès (URL,
+  version Dolibarr, durée, lien `/job`) ou 🔴 échec (raison, lien diagnostic).
+- Avertissement ⚠️ si le déploiement dépasse le délai maximal (12 min) sans
+  se conclure.
+- `CoolifyConnector` : `list_active_deployments()`, `is_deployment_active()`,
+  `application_is_running()` pour détecter la fin et le résultat d'un déploiement.
+
+### Changed
+- `on_confirm` ne marque plus le job `active` immédiatement : le job reste
+  `running` puis passe à `active` (succès) ou `failed` (échec) selon le suivi.
+- Dépendance `python-telegram-bot` désormais installée avec l'extra
+  `[job-queue]` (requis pour le suivi en tâche de fond).
+
+### Fixed
+- Le statut `active` était affiché alors que le déploiement continuait en
+  arrière-plan : il reflète maintenant l'état réel de fin de déploiement.
+
 ## [0.2.0] - 2026-08-15
 
 Première version déployant de vrais packs depuis le catalogue.

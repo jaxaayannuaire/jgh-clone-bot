@@ -204,13 +204,76 @@ class CoolifyConnector:
         return self._request("GET", f"applications/{app_uuid}")
 
     def application_status(self, app_uuid: str) -> str:
-        """Statut courant d'une app ('running', 'exited', 'degraded'...)."""
+        """Statut courant d'une app ('running:healthy', 'exited', 'degraded'...).
+
+        NB : le champ a la forme '<état>:<santé>'. Quand le healthcheck est
+        désactivé, la santé vaut 'unknown' (ex: 'running:unknown'). L'état
+        avant le ':' est donc le signal fiable : 'running' = OK, 'exited' /
+        'degraded' = problème.
+        """
         app = self.get_application(app_uuid)
         # Le champ exact varie selon la version : on tente plusieurs clés.
         return (app.get("status")
                 or app.get("last_online_at")
                 and "running"
                 or "unknown")
+
+    # -- Suivi des déploiements (pour la notification de fin) ----------------
+
+    def list_active_deployments(self) -> list[dict]:
+        """
+        Liste les déploiements EN COURS ou EN FILE (in_progress / queued).
+
+        Comportement observé sur Coolify 4.1.2 : GET /deployments ne renvoie
+        QUE les déploiements actifs. Un déploiement y figure avec
+        status='in_progress' (ou 'queued'), puis DISPARAÎT de la liste une
+        fois terminé (succès comme échec). La disparition est donc le signal
+        de « déploiement fini » ; le résultat (succès/échec) se lit ensuite
+        sur le status de l'application.
+
+        Chaque entrée contient notamment :
+          - status              : 'in_progress' | 'queued'
+          - application_name    : nom de l'app (ex: 'jgh-testfin-pos-1786825723')
+          - application_uuid    : uuid de l'app
+          - deployment_uuid     : uuid du déploiement lui-même
+        """
+        data = self._request("GET", "deployments")
+        return data if isinstance(data, list) else []
+
+    def is_deployment_active(self, *, app_uuid: str = "",
+                             app_name: str = "",
+                             deployment_uuid: str = "") -> bool:
+        """
+        Indique si un déploiement donné est encore actif (présent dans
+        /deployments). On peut l'identifier par uuid de déploiement, uuid
+        d'app, ou nom d'app (au moins un requis).
+
+        Renvoie True tant que le déploiement est in_progress/queued,
+        False dès qu'il a disparu de la liste (= terminé).
+        """
+        deployments = self.list_active_deployments()
+        for d in deployments:
+            if deployment_uuid and d.get("deployment_uuid") == deployment_uuid:
+                return True
+            if app_uuid and d.get("application_uuid") == app_uuid:
+                return True
+            if app_name and d.get("application_name") == app_name:
+                return True
+        return False
+
+    def application_is_running(self, app_uuid: str) -> bool:
+        """
+        True si l'application tourne (état 'running' avant le ':' du status).
+        Utilisé après la fin d'un déploiement pour distinguer succès (running)
+        d'échec (exited/degraded/absent).
+        """
+        try:
+            status = self.application_status(app_uuid)
+        except CoolifyError:
+            return False
+        # status ~ 'running:unknown' | 'exited:unhealthy' | 'degraded' ...
+        etat = (status or "").split(":", 1)[0].strip().lower()
+        return etat == "running"
 
     # -- Création : voie hybride Compose ------------------------------------
 
