@@ -166,7 +166,13 @@ class WooConnector:
         session.mount("https://", adapter)
         # WooCommerce : auth Basic (consumer_key:consumer_secret) sur HTTPS.
         session.auth = (self.cfg.consumer_key, self.cfg.consumer_secret)
-        session.headers.update({"Accept": "application/json"})
+        # User-Agent explicite : beaucoup de pare-feux WordPress (Wordfence,
+        # règles anti-bot d'hébergeurs) bloquent le UA par défaut
+        # "python-requests/x.y" (403). On s'identifie proprement.
+        session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "JGH-Clone-Bot/1.0 (+https://yessalerp.com)",
+        })
         return session
 
     def _request(self, method: str, path: str,
