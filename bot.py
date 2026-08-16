@@ -133,10 +133,12 @@ def build_woo_connector() -> Optional[WooConnector]:
     """Construit le connecteur WooCommerce si les clés sont configurées.
 
     Renvoie None si non configuré (le bot fonctionne alors sans /commandes).
+    Les valeurs sont nettoyées (.strip()) car un espace/retour parasite dans
+    le .env suffit à provoquer un 401 à l'authentification.
     """
-    key = os.environ.get("WOO_CONSUMER_KEY", "")
-    secret = os.environ.get("WOO_CONSUMER_SECRET", "")
-    base = os.environ.get("WOO_BASE_URL", "")
+    key = os.environ.get("WOO_CONSUMER_KEY", "").strip()
+    secret = os.environ.get("WOO_CONSUMER_SECRET", "").strip()
+    base = os.environ.get("WOO_BASE_URL", "").strip()
     if not (key and secret and base):
         return None
     cfg = WooConfig(
