@@ -1,7 +1,14 @@
-# JGH Clone Bot — Étude d'architecture
+# JGH Clone Bot — Architecture
 
-**Version 1.1 — Août 2026** *(§4.5 ajouté : organisation GitHub tranchée — un repo par pack ; §13.4 clos)*
-**Bras exécutant du provisioning conteneurisé de Jaxaay Group : déploiement d'instances Dolibarr sectorisées via Coolify (API REST), catalogue de packs versionnés sur GitHub, migration des documents depuis le serveur master, pilotage Telegram. Successeur du pipeline n8n de clonage live.**
+> **Version 1.2** — août 2026. Ce document décrit **uniquement l'architecture
+> validée et testée**. Les décisions explorées puis abandonnées (ex. montage du
+> code en volume) sont consignées dans `DECISIONS.md`, pas ici : l'architecture
+> reste une référence fiable de l'état réel du système.
+>
+> Changements majeurs depuis la v1.1 : passage à la **Stratégie B** (deux images
+> cuites par pack, publiées sur GitHub Container Registry) ; documents injectés
+> au premier boot par un wrapper d'entrypoint ; suivi de fin de déploiement ;
+> gestion du type d'instance (test/client) et suppression sécurisée.
 
 ---
 
@@ -9,37 +16,52 @@
 
 ### 1.1 Ce qu'est JGH Clone Bot
 
-JGH Clone Bot est le **composant d'exécution du provisioning** de la plateforme JGH Hosting / YessalERP. Il matérialise en Python l'`InstanceOrchestrator` décrit dans `YessalERP_Projet.md`, piloté par Telegram en phase 1, appelable par WooCommerce/Laravel plus tard.
+JGH Clone Bot est le **composant d'exécution du provisioning** de la plateforme
+JGH Hosting / YessalERP. Il déploie des instances **Dolibarr sectorisées**
+(packs) via l'API Coolify, piloté par Telegram. À terme, une version de cet
+outil sera intégrée à YessalERP pour déployer des packs Dolibarr, WordPress et
+autres.
 
-Il fait partie d'un ensemble de trois briques qui partagent la même infrastructure et les mêmes patterns :
+Il fait partie d'un ensemble de trois briques qui partagent la même
+infrastructure et les mêmes patterns :
 
 | Brique | Rôle | Posture |
 |---|---|---|
-| **JGH Alert Bot** (v1.18.0, opérationnel) | Supervision, échéances, alertes | **Lecture seule** |
-| **JGH Clone Bot** (ce document) | Provisioning, clonage, migration, restauration | **Écrit et exécute** |
+| **JGH Alert Bot** (opérationnel) | Supervision, échéances, alertes | **Lecture seule** |
+| **JGH Clone Bot** (ce document) | Provisioning, suppression, migration | **Écrit et exécute** |
 | **JG Hosting / YessalERP** | Couche commerciale + control plane Laravel | Orchestration |
 
 ### 1.2 Décision structurante : Coolify est le cœur
 
-La décision fondatrice, tranchée en amont de ce document : **Coolify (conteneurs Docker) est le paradigme nominal du provisioning ; le clonage live ISPConfig→CloudPanel n'est plus qu'un outil de migration one-shot.**
+**Coolify (conteneurs Docker) est le paradigme nominal du provisioning ; le
+clonage live ISPConfig→CloudPanel n'est plus qu'un outil de migration
+one-shot.**
 
-Cela découle directement de `comparaison-cloudpanel-vs-coolify-yessalerp.md` et `JG_Hosting_Synthese.md` : l'image Docker officielle Dolibarr se configure par variables d'environnement (`DOLI_DB_*`, `DOLI_URL_ROOT`, `DOLI_ENABLE_MODULES`), ce qui **supprime l'étape `sed -i` sur `conf.php`** — la partie la plus fragile du pipeline historique.
+L'image Docker Dolibarr se configure par variables d'environnement
+(`DOLI_DB_*`, `DOLI_URL_ROOT`, `DOLI_INSTALL_AUTO`…), ce qui **supprime l'étape
+`sed -i` sur `conf.php`** — la partie la plus fragile du pipeline historique.
 
 ### 1.3 Les trois modes du bot
 
 | Mode | Usage | Paradigme | Priorité |
 |---|---|---|---|
-| **provision** | Nouveau client → nouvelle instance | Coolify + image + code monté + seed SQL | Nominal (Phases 1–2) |
-| **migrate** | Client legacy ISPConfig/CloudPanel → conteneur | Dump live + import dans conteneur neuf | One-shot (Phase 4) |
-| **restore** | Restauration d'instance depuis sauvegarde | Réhydratation base + volume documents | Phase 5 |
+| **provision** | Nouveau client → nouvelle instance | Coolify + deux images de pack (ghcr.io) | Nominal |
+| **migrate** | Client legacy ISPConfig/CloudPanel → conteneur | Dump live → conteneur neuf | One-shot (plus tard) |
+| **restore** | Restauration depuis sauvegarde | Réhydratation base + volume documents | Plus tard |
 
-> Le mode `provision` est le cœur. Le mode `migrate` réutilise la logique de l'ancien pipeline n8n **uniquement comme voie de sortie du legacy**, jamais comme voie d'entrée.
+> Le mode `provision` est le cœur, validé de bout en bout. Les modes `migrate`
+> et `restore` viendront ensuite.
 
 ### 1.4 Ce que JGH Clone Bot n'est PAS
 
-- **Pas le module de publication de packs.** Ce module vit dans Dolibarr (composant PHP autonome, §7). Le bot **consomme** le catalogue de versions, il ne le produit pas.
-- **Pas le control plane commercial.** WooCommerce/Laravel restent maîtres de l'état commercial. Le bot exécute des ordres de provisioning.
-- **Pas un orchestrateur généraliste dès le départ.** On commence par Dolibarr (cas le plus mûr), on généralise après.
+- **Pas le module de publication de packs.** La transformation d'une instance de
+  référence en artefacts de pack est faite par `publish_pack.py` +
+  `build_pack_image.sh` (composants distincts, §7). Le bot **consomme** les
+  images publiées, il ne les produit pas.
+- **Pas le control plane commercial.** WooCommerce/Laravel restent maîtres de
+  l'état commercial. Le bot exécute des ordres de provisioning.
+- **Pas un orchestrateur généraliste dès le départ.** On commence par Dolibarr
+  (cas le plus mûr), on généralise après.
 
 ---
 
@@ -49,20 +71,17 @@ JGH Clone Bot réutilise le socle éprouvé plutôt que de réinventer.
 
 ### Patterns réutilisés tels quels
 - **Contrôle-plan / données-plan** : le bot orchestre, Coolify exécute.
-- **Connexion DuckDB unique stable** + schéma versionné.
-- **Sentinelles `JGH_JSON_START…END`** pour tout parsing de stdout SSH (mode migrate surtout).
-- **File `pending_*` + boutons inline Telegram ✅/❌** : un clonage est une action destructive/coûteuse, même circuit de confirmation.
-- **Connecteurs par compte OVH** (multi-comptes, CK par compte).
-- **Secrets hors repo**, systemd, déploiement par git, français, fuseau Africa/Dakar.
-
-### Intégrations réutilisées (clients déjà codés et testés)
-- **Client Dolibarr** (`dolibarr_client.py`) : REST avec allowlist/denylist — pour créer projet/tiers/contrat et injecter les données client après boot.
-- **Client OVH** (`ovh_client.py`) : provisionner de nouveaux services (domaines, VPS) le jour venu.
-- **Client Telegram** : interface de commande et confirmation.
-- **Miroirs Google Sheets/Agenda** : pour journaliser les opérations de clonage.
+- **Connexion DuckDB unique stable** + schéma versionné (migration douce).
+- **File `pending_actions` + boutons inline Telegram ✅/❌** : toute action
+  destructive/coûteuse passe par le même circuit de confirmation.
+- **Secrets hors repo**, service systemd, déploiement par git, langue française,
+  fuseau Africa/Dakar.
 
 ### Le changement de posture majeur
-**Alert Bot est lecture seule ; Clone Bot écrit et exécute sur des serveurs de production.** C'est le sujet de sécurité central (§8). Là où Alert Bot utilise une clé SSH à commande forcée en lecture seule, Clone Bot agit par **jetons Coolify scopés** (`write`/`deploy`) — une surface d'attaque réduite et versionnée, pas un SSH root large.
+**Alert Bot est lecture seule ; Clone Bot écrit et exécute sur des serveurs de
+production.** C'est le sujet de sécurité central (§8). Clone Bot agit par
+**jetons Coolify scopés** (`write`/`deploy`) — surface réduite et versionnée,
+pas un SSH root large.
 
 ---
 
@@ -74,125 +93,109 @@ JGH Clone Bot réutilise le socle éprouvé plutôt que de réinventer.
 │                    57.131.27.63 — CloudPanel                    │
 │                                                                 │
 │  ┌──────────┐   /provision      ┌────────────────────────────┐ │
-│  │ Telegram │◄──/migrate───────►│    JGH Clone Bot (py)       │ │
-│  │  (admin) │   /packs /jobs    │    python-telegram-bot      │ │
-│  └──────────┘   ✅/❌ confirm    │    + JobQueue               │ │
+│  │ Telegram │◄──/delete────────►│    JGH Clone Bot (py)       │ │
+│  │  (admin) │   /instances      │    python-telegram-bot      │ │
+│  └──────────┘   ✅/❌ confirm    │    + JobQueue (suivi)       │ │
 │                                 │  ┌──────────────────────┐   │ │
-│  ┌──────────┐                   │  │  DuckDB clone.duckdb │   │ │
-│  │ WooCommerce│──webhook──(P.6)─►│  │  clone_jobs          │   │ │
-│  │ /Laravel   │  order.completed │  │  pack_versions       │   │ │
-│  └──────────┘                   │  └──────────────────────┘   │ │
+│                                 │  │  DuckDB clone.duckdb │   │ │
+│                                 │  │  clone_jobs          │   │ │
+│                                 │  │  pending_actions     │   │ │
+│                                 │  └──────────────────────┘   │ │
 │                                 │  ┌──────────────────────┐   │ │
-│                                 │  │  Connecteurs         │   │ │
-│                                 │  │  ├─ CoolifyConnector │   │ │
-│                                 │  │  ├─ GitHubConnector  │   │ │
-│                                 │  │  ├─ DocumentsMover   │   │ │
-│                                 │  │  ├─ DolibarrClient   │   │ │
-│                                 │  │  └─ (SSH migrate)    │   │ │
-│                                 │  └──┬────────┬──────┬───┘   │ │
-│                                 └─────┼────────┼──────┼───────┘ │
-└───────────────────────────────────────┼────────┼──────┼─────────┘
-              API REST /api/v1  ▲        │        │      │
-                                │   GitHub API    │   SSH (documents)
-                    ┌───────────┴──────┐ │        │      │
-                    │ VPS 2 — Coolify  │ │  ┌─────▼────┐ │
-                    │ (control plane)  │ │  │ GitHub   │ │
-                    │  57.x.x.x        │ │  │ (code +  │ │
-                    └────────┬─────────┘ │  │  dump)   │ │
-                        SSH  │ (interne  │  └──────────┘ │
-                             │  Coolify) │               │
-                    ┌────────▼─────────┐ │        ┌──────▼────────┐
-                    │ VPS TEST/DÉPLOI  │◄┘        │ SERVEUR MASTER│
-                    │ flotte Dolibarr  │◄─────────│ documents/    │
-                    │ conteneurs Docker│  docs    │ zip par version│
-                    └──────────────────┘          └───────────────┘
+│                                 │  │  CoolifyConnector    │   │ │
+│                                 │  └──────────┬───────────┘   │ │
+│                                 └─────────────┼───────────────┘ │
+└───────────────────────────────────────────────┼─────────────────┘
+                       API REST /api/v1  ▲       │
+                                         │       │
+                    ┌────────────────────┴──┐    │  git clone (deploy key)
+                    │  VPS COOLIFY           │    │
+                    │  (control plane)       │    ▼
+                    │                        │  ┌──────────────────────┐
+                    │  clone le repo du pack │  │ GitHub               │
+                    │  tire les images ──────┼─►│  jgh-pack-<pack>      │
+                    │  déploie 2 conteneurs  │  │  (docker-compose.yml) │
+                    └───────────┬────────────┘  └──────────────────────┘
+                                │  docker pull
+                                ▼
+                    ┌────────────────────────┐  ┌──────────────────────┐
+                    │  ghcr.io (privé)       │  │ Instance déployée    │
+                    │  jgh-pack-<pack>       │─►│  • dolib (Dolibarr)  │
+                    │  jgh-pack-<pack>-db    │  │  • db (MariaDB+dump) │
+                    │  jgh-dolibarr (commune)│  │  documents injectés  │
+                    └────────────────────────┘  └──────────────────────┘
 ```
 
 ### Principes directeurs
 
-- **Le bot ne parle jamais SSH aux conteneurs.** Il pilote Coolify par API REST ; Coolify gère le SSH vers ses cibles en interne.
-- **GitHub est le registre de code + structure.** Le code Dolibarr (sans documents) et le dump SQL de seed vivent dans GitHub, versionnés par tags/releases.
-- **Le serveur master détient les documents** (trop lourds pour git), archivés en zip par version, migrés au déploiement.
-- **DuckDB est la source de vérité locale** de l'état des jobs et du catalogue de packs.
-- **Toute action destructive/coûteuse passe par confirmation** (file `pending`, boutons Telegram).
+- **Le bot ne parle jamais SSH aux conteneurs.** Il pilote Coolify par API
+  REST ; Coolify gère l'exécution vers ses cibles en interne.
+- **GitHub Container Registry (`ghcr.io`) est le registre d'images.** Tout le
+  projet JGH y publie ses images (privées). Le self-hosted est réservé aux
+  projets clients sur mesure.
+- **Le repo Git d'un pack ne contient que son `docker-compose.yml`.** Le code,
+  les données et les documents sont dans les images ghcr.io, pas dans le repo.
+- **DuckDB est la source de vérité locale** de l'état des jobs et instances.
+- **Toute action destructive/coûteuse passe par confirmation** (file `pending`,
+  boutons Telegram ; saisie du nom pour les instances client).
 
 ---
 
-## 4. Le modèle de packs (rappel figé)
+## 4. Le modèle de packs — Stratégie B (validée)
 
-### 4.1 Trois artefacts par version de pack
+### 4.1 Deux images cuites par pack
 
-| Artefact | Contenu | Où | Poids type |
-|---|---|---|---|
-| **Code** | Fichiers Dolibarr + `custom/`, **sans** documents | GitHub (tag/release) | ~150 Mo |
-| **Structure + seed** | Dump SQL | GitHub (avec le code) | ~30 Mo |
-| **Documents d'exemple** | Fichiers d'exemple (noms/sociétés **fictifs**) | Serveur master, zip par version | ~70 Mo |
+Chaque pack se matérialise en **deux images Docker autonomes**, publiées sur
+`ghcr.io` (privées) :
 
-> **Règle validée** : les documents de référence ne contiennent que des données d'exemple fictives — jamais de données d'un vrai client. Le zip sert au **seed initial** d'un nouveau clone et à la **restauration du pack de référence**, distinct du backup des données client (volume `documents` par tenant).
+| Image | Contenu |
+|---|---|
+| `ghcr.io/jaxaayannuaire/jgh-pack-<pack>:<version>` | Dolibarr + surcharges cœur + modules `custom/` + documents d'exemple + wrapper d'entrypoint |
+| `ghcr.io/jaxaayannuaire/jgh-pack-<pack>-db:<version>` | MariaDB + dump SQL du pack (données d'exemple, modules activés) |
 
-### 4.2 Les packs et leur cycle de vie
+Une **image commune** `ghcr.io/jaxaayannuaire/jgh-dolibarr:<version-doli>`
+(Dolibarr officiel + surcharges cœur) sert de base à l'image applicative de
+chaque pack.
 
-Cinq packs au catalogue : **Tambali, Asso, Pro, Immo, POS**. Démarrage effectif avec **POS** (`pos.yessal.com`) et **Pro** (`packpro.yessal.com`).
+> **Ce qui distingue un pack d'un autre** (modules activés, TakePOS, etc.) vit
+> dans le **dump SQL** de l'image `-db`, pas dans du code séparé. Le pack POS est
+> le modèle de référence validé.
 
-Cadence : **2 versions par pack et par an**. Seules les **2 dernières versions** de chaque pack sont actives pour le clonage ; les plus anciennes sont archivées (Google Drive / serveur d'archive) puis supprimées du VPS master et de GitHub.
+### 4.2 Les trois mécanismes d'injection (validés)
 
-```
-Ex : Pack TBLI v1.0.0 (janv. 2027) ── active
-     Pack TBLI v2.0.0 (juin 2027)  ── active
-     → au lancement de v3.0.0, v1.0.0 passe "archived" puis est purgée
-```
+**Import du dump — par MariaDB, avant Dolibarr.**
+Le dump du pack est placé dans `/docker-entrypoint-initdb.d/` de l'image `-db`.
+MariaDB l'importe **à la création de la base**, avant que Dolibarr démarre.
+Dolibarr trouve alors une base déjà peuplée et **saute son installation**
+(message « Schema update is not required … Enjoy ! »). C'est ce qui résout le
+conflit avec `DOLI_INSTALL_AUTO`.
 
-### 4.3 Stratégie Docker : image par version de Dolibarr, pas par pack
+**Documents — injectés au premier boot par un wrapper d'entrypoint.**
+Les documents d'exemple (logos, images de catégories, PDF) sont cuits dans
+l'image applicative sous `/opt/jgh/`. Un wrapper `jgh-entrypoint.sh` les
+décompresse dans le volume `/var/www/documents` au premier démarrage (marqueur
+`.jgh_documents_initialized` pour ne jamais écraser les données d'un client),
+puis passe la main à l'entrypoint officiel (`docker-run.sh apache2-foreground`).
+Ce wrapper est nécessaire car Dolibarr **saute** ses scripts `docker-init.d`
+quand la base est déjà installée.
 
-La décision d'architecture la plus importante pour la maîtrise des coûts :
+**Encadrement du dump SQL — clés étrangères.**
+Le dump est encadré par `SET FOREIGN_KEY_CHECKS=0` (+ réactivation en pied) pour
+un import fiable, car l'ordre alphabétique des tables provoque sinon des erreurs
+de clés étrangères (1005 errno 150).
 
-> **Le nombre d'images Docker ≈ le nombre de versions de Dolibarr encore en production (2–3 vivantes), jamais le nombre de variantes de packs (20).**
+### 4.3 Cycle de vie des packs
 
-Ce qui distingue un pack d'un autre (modules, code `custom/`, seed) est monté **par-dessus** une image Dolibarr commune, pas cuit dans une image dédiée.
+Cinq packs au catalogue cible : **POS, Tambali, Asso, Pro, Immo**. Démarrage
+effectif validé avec **POS** (`pos.yessal.com` comme référence).
 
-| Ce qui varie | Vit dans | Mécanisme |
-|---|---|---|
-| Binaire Dolibarr + PHP | **Image Docker** | `jgh/dolibarr:<version-doli>` (2–3 vivantes) |
-| Modules activés | Variable d'env | `DOLI_ENABLE_MODULES` |
-| Code maison `custom/` | **Volume monté** | tag GitHub cloné sur l'hôte |
-| Données de seed | Import au déploiement | dump SQL du tag |
-| Documents d'exemple | Archive montée | zip master → volume tenant |
+Chaque version stable est taguée en semver (`1.0.0`). Une variante `-dev` (images
+taguées `<version>-dev`) servira aux déploiements de test jetables.
 
-**Conséquence opérationnelle décisive** : un patch de sécurité Dolibarr = reconstruire **une image**, dont héritent les 20 combinaisons au prochain déploiement. Avec « une image par variante », ce serait un chantier de 20 rebuilds.
+### 4.4 Organisation GitHub
 
-### 4.4 Montage du code : volume (option retenue)
-
-Le code du pack est **monté en volume** depuis le tag GitHub cloné sur l'hôte (pas copié au boot, pas buildé dans l'image) :
-
-```
-/data/packs/pos-v1.0.0/custom     ← git checkout du tag
-        │ monté READ-ONLY ▼
-Conteneur Dolibarr (image jgh/dolibarr:21)
-   /var/www/html/custom   ←── volume code pack (READ-ONLY)
-   /var/www/documents     ←── volume documents tenant (READ-WRITE)
-   DOLI_*                 ←── envs/bulk (remplace le sed)
-```
-
-- `custom/` du pack en **lecture seule** (c'est du code, il ne doit pas muter en prod).
-- `documents/` du tenant en **lecture-écriture** (données du client).
-- **Ne jamais mélanger les deux volumes.**
-
-> **Exception** : un pack exigeant une extension PHP exotique ou une modification du cœur Dolibarr bascule — lui seul — en image dédiée (build multi-stage). Pour du Dolibarr sectorisé standard, le volume suffit.
-
-> **À valider au premier déploiement test** : le point de montage exact de `custom/` dépend de l'arborescence de l'image Dolibarr officielle réellement utilisée. Réglage de chemin, pas changement de stratégie.
-
-### 4.5 Organisation GitHub : un repo par pack (décidé)
-
-**Décision : un repo GitHub privé par pack**, pas un repo commun à tags préfixés. Facteurs décisifs :
-
-- **Poids** — le code d'un pack pèse ~180 Mo/version et l'historique git ne se purge pas quand on supprime un tag (le blob reste dans l'historique). Un repo commun accumulerait 5 packs × versions et deviendrait un dépôt de plusieurs Go, lent à cloner. Cinq repos bornés restent sains.
-- **Cycle de vie** — la règle « archiver puis purger les vieilles versions » s'applique proprement repo par repo, jusqu'à l'abandon complet d'un pack (on archive/supprime le repo entier).
-- **Isolation d'accès** — une deploy key Coolify par repo n'ouvre l'accès qu'à un seul pack, jamais à tout le catalogue (privilège minimal, cohérent avec les jetons scopés et l'allowlist Dolibarr).
-- **Lisibilité** — releases et changelogs isolés par pack, ce qui sert directement `/pack_info` et la présentation catalogue WooCommerce.
-
-> Le partage de code entre packs n'est **pas** un besoin ici : le socle Dolibarr commun vit dans l'**image Docker**, pas dans les repos ; chaque pack sectoriel n'a que son propre code métier. L'argument monorepo (mutualiser du code commun) tombe donc.
-
-**Convention de nommage des repos** (figée) :
+**Un dépôt Git privé par pack**, contenant uniquement le `docker-compose.yml` de
+production et un README. Convention :
 
 ```
 jaxaayannuaire/jgh-pack-pos
@@ -202,295 +205,242 @@ jaxaayannuaire/jgh-pack-asso
 jaxaayannuaire/jgh-pack-immo
 ```
 
-**Tags par repo** : semver simple, sans préfixe de pack (le repo *est* le pack) — `v1.0.0`, `v2.0.0`, `v3.0.0`…
+**Une deploy key Coolify par repo** (privilège minimal : n'ouvre l'accès qu'à un
+seul pack). Le bot lit une config statique `pack → {repo, deploy key, service}`
+dans son catalogue `PACKS` (les UUID de deploy key viennent du `.env`).
 
-**Une deploy key Coolify par repo**, générée au moment de brancher chaque pack sur Coolify.
+Comme le repo ne contient qu'un fichier compose (quelques Ko), l'argument du
+poids qui justifiait autrefois un repo par pack ne s'applique plus, mais la
+séparation reste retenue pour l'**isolation d'accès** (une deploy key par pack)
+et la lisibilité.
 
-Le `GitHubConnector` lit une **config statique** `pack → repo` (pas de découverte automatique : 5 packs connus, pas 500) :
+### 4.5 Le service applicatif s'appelle `dolib`
 
-```python
-PACKS = {
-    "pos":     "jaxaayannuaire/jgh-pack-pos",
-    "pro":     "jaxaayannuaire/jgh-pack-pro",
-    "tambali": "jaxaayannuaire/jgh-pack-tambali",
-    "asso":    "jaxaayannuaire/jgh-pack-asso",
-    "immo":    "jaxaayannuaire/jgh-pack-immo",
-}
-```
-
-`catalog_sync` boucle sur ces repos, lit les releases GitHub de chacun et alimente `pack_versions` (le champ `github_repo` stocke le repo par ligne — voir §9).
+Convention imposée par le connecteur : tous les `docker-compose.yml` de packs
+déclarent un service applicatif nommé **`dolib`**, que Coolify cible pour le
+domaine (`docker_compose_domains`).
 
 ---
 
 ## 5. L'API Coolify — routes utilisées
 
-Coolify **4.1.2**. API versionnée sous `/api/v1`, authentification par jeton Laravel Sanctum, permissions granulaires par jeton (`read`/`write`/`deploy`). Le bot utilise un jeton scopé `write`+`deploy` — **jamais `root`**.
+Coolify **4.1.2**. API versionnée sous `/api/v1`, authentification par jeton
+Laravel Sanctum, permissions granulaires (`read`/`write`/`deploy`). Le bot
+utilise un jeton scopé `write`+`deploy` — **jamais `root`**.
 
 | Besoin | Route | Permission |
 |---|---|---|
 | Créer l'app (repo privé, deploy key) | `POST /api/v1/applications/private-deploy-key` | write |
-| Créer l'app (image pré-construite) | `POST /api/v1/applications/dockerimage` | write |
-| Créer la base MariaDB du tenant | endpoints `databases` (section DB de l'API) | write |
-| Injecter les variables `DOLI_*` en masse | `PATCH /api/v1/applications/{uuid}/envs/bulk` | write |
 | Déclencher le déploiement | `POST /api/v1/applications/{uuid}/start` | deploy |
 | Arrêter / redémarrer | `POST /api/v1/applications/{uuid}/stop` \| `/restart` | deploy |
-| Détail / suivi d'une app | `GET /api/v1/applications/{uuid}` | read |
-| Supprimer (résiliation) | `DELETE /api/v1/applications/{uuid}` | write |
+| Détail d'une app (statut) | `GET /api/v1/applications/{uuid}` | read |
+| Lister les déploiements actifs | `GET /api/v1/deployments` | read |
+| Supprimer (résiliation, + volumes) | `DELETE /api/v1/applications/{uuid}?delete_volumes=true` | write |
 
 Paramètres utiles à la création :
-- **`instant_deploy`** (défaut `false`) : crée **et** déploie en un appel.
-- **`force_domain_override`** (défaut `false`) : renvoie **HTTP 409** si le sous-domaine est déjà pris → le bot traite le 409 comme « sous-domaine indisponible », jamais d'écrasement silencieux.
-- **`autogenerate_domain`** : à laisser `false` puisqu'on impose `client.yessalerp.com`.
+- **`instant_deploy`** (défaut `false`) : on sépare création et déploiement.
+- **`force_domain_override`** (défaut `false`) : renvoie **HTTP 409** si le
+  sous-domaine est déjà pris → jamais d'écrasement silencieux.
+- **`docker_compose_domains`** : tableau d'objets `{name, domain}` (le `name` est
+  le service du compose qui porte le domaine, ici `dolib` ; `domain` avec schéma
+  `https://`).
 
-> **Deux pièges connus, à gérer dès le code :**
-> 1. `removeSensitiveData` **ampute** certains champs de réponse (`dockerfile`, `docker_compose_raw`, secrets webhook…) si le jeton n'a pas la lecture sensible — ne pas confondre avec un bug.
-> 2. La doc Coolify a des **écarts spec/réalité** connus (ex. champ `environments` absent de la réponse `projects` alors que documenté). **Valider chaque payload contre l'instance 4.1.2 réelle** au moment de coder, sans se fier aveuglément à la spec.
+**Authentification ghcr.io** : les images privées sont tirées grâce au
+`docker login ghcr.io` de l'hôte de déploiement — aucune configuration de
+registre supplémentaire dans Coolify n'a été nécessaire (validé).
+
+> **Deux pièges connus :**
+> 1. `removeSensitiveData` **ampute** certains champs de réponse si le jeton n'a
+>    pas la lecture sensible — parsing défensif obligatoire.
+> 2. Écarts spec/réalité de la doc Coolify : **valider chaque payload contre
+>    l'instance 4.1.2 réelle** au moment de coder.
 
 ---
 
 ## 6. Flux de bout en bout — mode provision
 
 ```
-/provision pos v1.0.0 <client> <sous-domaine>   (Telegram, admin)
+/provision <client> <pack> [test]           (Telegram, admin)
         ↓
-[1] Le bot calcule le plan (nom base, sous-domaine, tag, image Doli)
-    → insère un clone_job en status='pending', dry_run=TRUE
+[1] Le bot résout le pack (catalogue) → deploy key, repo, service
+    → insère un clone_job status='pending', dry_run=TRUE, instance_type
         ↓
-[2] Message Telegram récapitulatif + boutons ✅ Confirmer / ❌ Ignorer
+[2] Message Telegram : plan (type test/client, pack, domaine) + ✅/❌
         ↓ (✅)
-[3] git checkout tag v1.0.0 depuis GitHub (code + dump SQL) → /data/packs/pos-v1.0.0
+[3] Coolify : POST applications/private-deploy-key
+    (repo du pack, deploy key, docker_compose_domains → service dolib)
         ↓
-[4] Coolify : création base + user MariaDB dédiés au tenant
+[4] POST {uuid}/start → déploiement
         ↓
-[5] Coolify : POST applications/... (image jgh/dolibarr:21, volume custom/, ports)
+[5] Coolify clone le repo, tire les 2 images ghcr.io
         ↓
-[6] PATCH envs/bulk : DOLI_DB_*, DOLI_URL_ROOT, DOLI_ENABLE_MODULES, admin initial
+[6] MariaDB importe le dump ; le wrapper injecte les documents ;
+    Dolibarr trouve la base peuplée → « Enjoy ! »
         ↓
-[7] POST {uuid}/start (ou instant_deploy=true) → déploiement conteneur
+[7] Traefik obtient le certificat SSL (sous-domaine)
         ↓
-[8] Import du dump SQL de seed dans la base du tenant
+[8] SUIVI (JobQueue) : le bot poll /deployments toutes les 15 s
         ↓
-[9] Migration documents : master → VPS déploiement (zip de la version, extraction volume)
+[9] Le déploiement disparaît de /deployments → terminé
+    status app running → job 'active' (online_at) ✅
+    sinon → job 'failed' 🔴 | timeout 12 min → ⚠️
         ↓
-[10] SSL : Traefik obtient le certificat Let's Encrypt (sous-domaine)
-        ↓
-[11] Injection client via API REST Dolibarr (raison sociale, XOF, admin client)
-        ↓
-[12] Vérif santé (l'instance répond) → clone_job status='active'
-        ↓
-    Notification Telegram + journalisation Sheets/Agenda
+    Notification Telegram de fin (URL, version, durée, /job)
 ```
 
-### Ordre de grandeur des temps (pack POS ~250 Mo)
+### Notification de fin (inspirée de l'e-mail d'installation OVH)
 
-| Régime | Durée |
-|---|---|
-| **1er déploiement d'un pack** (image Docker à télécharger) | ≈ 2 min 30 – 6 min |
-| **Déploiements suivants** (image en cache local) | ≈ 1 min 15 – 3 min 30 |
+Le bot ne considère plus un job `active` dès le déclenchement : il **surveille**
+le déploiement en tâche de fond (JobQueue, intervalle 15 s, timeout 12 min) et
+envoie un message de fin — ✅ succès (URL, version Dolibarr, durée, lien `/job`),
+🔴 échec (raison, diagnostic), ou ⚠️ dépassement de délai.
 
-Le pull de l'image est le seul gros poste, **ponctuel** et amorti sur toute la flotte grâce à l'image unique. Régime nominal cohérent avec l'estimation « ~2–4 min » de `JG_Hosting_Synthese.md`.
-
-### Contrat WooCommerce (Phase 6, à garder en tête dès maintenant)
-Quand le déclencheur deviendra commercial : webhook sur **`order.completed`**, jamais `order.created` (le mobile money passe souvent par `on-hold`). Idempotence par `woo_order_id`.
+Détection : un déploiement figure dans `GET /deployments` avec
+`status=in_progress`, puis **disparaît** de la liste une fois terminé. Le
+résultat (succès/échec) se lit ensuite sur le `status` de l'application
+(`running` = succès).
 
 ---
 
-## 7. Le module Dolibarr de publication (composant distinct)
+## 7. La publication de packs (composant distinct)
 
-Le « module de sauvegarde pour le clonage » est un **module Dolibarr maison (PHP)**, installé sur les environnements de référence (`pos.yessal.com`, `packpro.yessal.com`). **Il ne fait pas partie du bot** — il alimente le catalogue que le bot consomme. Cette séparation respecte le contrôle-plan / données-plan : la publication vit là où est la donnée.
+La transformation d'une instance Dolibarr de référence en artefacts de pack, puis
+en images, est faite par deux outils **hors du flux du bot** :
 
-### Rôle
-1. Écran admin « Publier une version » : numéro sémantique, changelog (fonctionnalités / fix / nouveautés), tags.
-2. Après validation admin :
-   - **Push code + dump SQL vers le repo GitHub dédié du pack** (`jgh-pack-<pack>`, release taguée `vX.Y.Z` via l'API GitHub — voir §4.5).
-   - **Déclenche l'archivage zip des documents** de la version sur le serveur master (`documents_<pack>_<version>.zip`).
-3. Enregistre les métadonnées de version que le bot/WooCommerce liront pour présenter le catalogue.
+- **`publish_pack.py`** : à partir de l'instance de référence, produit trois
+  artefacts — le dump SQL (encadré FK, tables volatiles purgées, références de
+  chemins neutralisées), l'archive `custom/` (modules maison), l'archive des
+  documents d'exemple.
+- **`build_pack_image.sh`** : assemble les artefacts en deux images
+  (`jgh-pack-<pack>` et `jgh-pack-<pack>-db`) à partir de l'image commune, puis
+  elles sont poussées sur ghcr.io.
 
-### Frontière avec le bot
-- **Le module publie** (produit les artefacts).
-- **Le bot consomme** : il lit les releases GitHub pour alimenter sa table `pack_versions`, et propose au clonage les versions actives.
+Le bot **consomme** les images publiées ; il ne les produit pas. Cette frontière
+est nette : publication en amont (rare, manuelle), déploiement en aval
+(fréquent, piloté).
 
 ---
 
 ## 8. Sécurité des exécutions
 
-Clone Bot écrit et exécute sur la production : c'est le sujet nouveau par rapport à Alert Bot.
+Clone Bot écrit et exécute sur la production : c'est le sujet nouveau par rapport
+à Alert Bot.
 
 | Principe | Mise en œuvre |
 |---|---|
 | **Confirmation systématique** | Toute action destructive/coûteuse passe par la file `pending` + boutons ✅/❌ (admins only) |
-| **Dry-run par défaut** | Le job calcule et affiche le plan complet (base, sous-domaine, tag, image) **avant** toute écriture |
-| **Idempotence** | Clé de job unique (`idempotency_key`) : rejouer un clonage échoué ne double rien |
-| **Privilège minimal** | Jeton Coolify scopé `write`+`deploy`, jamais `root` ; pas de SSH root large |
-| **Trace intégrale** | stdout/stderr de chaque job conservés (`clone_jobs.stdout_log`), comme `provisioning_jobs` |
-| **Rollback** | Job échoué → `status='failed'` + trace exacte, rejouable sur sa clé d'idempotence |
-| **Denylist Dolibarr** | Reprise de l'allowlist/denylist du client existant (secrets `loginovh`/`loginrootvps`/`rootpassword` jamais lus/écrits) |
-| **Secrets** | `.env` chmod 600, `keys/` gitignored ; jetons Coolify/GitHub hors repo |
+| **Dry-run par défaut** | Le job affiche le plan complet (type, pack, domaine) **avant** toute écriture |
+| **Suppression graduée** | Instance **test** : double confirmation par boutons. Instance **client** : saisie du nom exact (façon Coolify) |
+| **Idempotence** | Clé de job unique (`idempotency_key`) : rejouer un provision ne double rien |
+| **Privilège minimal** | Jeton Coolify scopé `write`+`deploy`, jamais `root` ; une deploy key par pack |
+| **Trace intégrale** | stdout de chaque job conservé (`clone_jobs.stdout_log`), horodatage des étapes |
+| **Refus des états incohérents** | Pas de suppression d'un déploiement encore en cours |
+| **Secrets** | `.env` hors repo (gitignore), jetons Coolify/GitHub et deploy keys jamais versionnés ; token ghcr.io en lecture seule côté déploiement |
 | **Conflits de domaine** | `force_domain_override=false` → 409 traité explicitement, jamais d'écrasement |
-
-> **Règle non négociable héritée** : une seule image pour toute la flotte, modules par variable d'env, code maison en volume `custom/`. Un client = une configuration, **jamais** une image dédiée.
 
 ---
 
 ## 9. Modèle de données DuckDB
 
-```sql
--- Catalogue des versions de packs (miroir des releases GitHub)
-CREATE TABLE IF NOT EXISTS pack_versions (
-    id INTEGER PRIMARY KEY,
-    pack VARCHAR NOT NULL,              -- 'pos','pro','tambali','asso','immo'
-    version VARCHAR NOT NULL,           -- '1.0.0' (semver)
-    dolibarr_image VARCHAR NOT NULL,    -- 'jgh/dolibarr:21'
-    github_repo VARCHAR,                -- repo GitHub du code (jgh-pack-<pack>, §4.5)
-    github_tag VARCHAR,                 -- tag de la release (vX.Y.Z, semver simple)
-    documents_zip VARCHAR,             -- nom de l'archive sur le master
-    modules VARCHAR,                    -- liste DOLI_ENABLE_MODULES
-    changelog TEXT,                     -- fonctionnalités / fix / nouveautés
-    status VARCHAR DEFAULT 'active',    -- 'active' | 'archived' | 'purged'
-    published_at TIMESTAMP,
-    UNIQUE (pack, version)
-);
+Connexion unique stable, schéma versionné avec **migration douce**
+(`ALTER TABLE ADD COLUMN IF NOT EXISTS`) : les bases existantes sont mises à jour
+au démarrage sans perte.
 
--- Jobs de provisioning / migration / restauration
-CREATE TABLE IF NOT EXISTS clone_jobs (
-    id INTEGER PRIMARY KEY,
-    job_type VARCHAR NOT NULL,          -- 'provision' | 'migrate' | 'restore'
-    idempotency_key VARCHAR UNIQUE,     -- rejeu sans doublon (woo_order_id en P.6)
-    client_name VARCHAR,
-    pack VARCHAR,
-    pack_version VARCHAR,
-    subdomain VARCHAR,
-    dolibarr_socid INTEGER,             -- tiers Dolibarr lié (injection client)
-    coolify_app_uuid VARCHAR,           -- UUID de l'app Coolify créée
-    coolify_db_uuid VARCHAR,            -- UUID de la base MariaDB tenant
-    db_name VARCHAR,
-    status VARCHAR DEFAULT 'pending',   -- pending|confirmed|running|active|failed
-    dry_run BOOLEAN DEFAULT TRUE,
-    stdout_log TEXT,                    -- trace exacte conservée
-    error_message TEXT,
-    created_at TIMESTAMP DEFAULT current_timestamp,
-    confirmed_at TIMESTAMP,
-    resolved_at TIMESTAMP
-);
+### Table `clone_jobs`
 
--- File de confirmation (même pattern que pending_dolibarr_writes d'Alert Bot)
-CREATE TABLE IF NOT EXISTS pending_actions (
-    id INTEGER PRIMARY KEY,
-    job_id INTEGER REFERENCES clone_jobs(id),
-    action_type VARCHAR,                -- 'provision' | 'delete' | 'migrate' | ...
-    summary VARCHAR,                    -- récap montré sur Telegram
-    status VARCHAR DEFAULT 'pending',   -- pending|confirmed|rejected|expired
-    created_at TIMESTAMP DEFAULT current_timestamp,
-    resolved_at TIMESTAMP
-);
+| Champ | Rôle |
+|---|---|
+| `id` | Identifiant du job/instance |
+| `job_type` | `provision` \| `migrate` \| `restore` |
+| `idempotency_key` | Rejeu sans doublon |
+| `client_name` | Nom logique de l'instance |
+| `subdomain` | Domaine complet déployé |
+| `git_repository`, `git_branch` | Repo du pack déployé |
+| `coolify_app_uuid` | UUID de l'app Coolify créée |
+| `instance_type` | `client` (défaut, prudent) \| `test` — gouverne la suppression |
+| `status` | `pending`\|`confirmed`\|`running`\|`active`\|`failed`\|`deleted` |
+| `stdout_log` | Trace horodatée des étapes |
+| `error_message` | Message d'erreur éventuel |
+| `created_at`, `confirmed_at` | Horodatages de création / confirmation |
+| `online_at` | Mise en ligne (premier passage `active`) |
+| `resolved_at`, `deleted_at` | Résolution / suppression effective |
 
--- Instances déployées (état courant de la flotte)
-CREATE TABLE IF NOT EXISTS instances (
-    id INTEGER PRIMARY KEY,
-    client_name VARCHAR,
-    pack VARCHAR,
-    pack_version VARCHAR,
-    subdomain VARCHAR UNIQUE,
-    coolify_app_uuid VARCHAR,
-    dolibarr_socid INTEGER,
-    status VARCHAR DEFAULT 'active',    -- active|suspended|terminated
-    deployed_at TIMESTAMP,
-    expires_on DATE                     -- repris de Woo/Dolibarr (jonction Alert Bot)
-);
-```
+### Table `pending_actions`
+
+File de confirmation (pattern Alert Bot) : `job_id`, `action_type`
+(`provision`\|`delete`), `summary`, `status`
+(`pending`\|`confirmed`\|`rejected`), horodatages.
 
 ---
 
-## 10. Arborescence du projet (proposition)
+## 10. Arborescence du projet
 
 ```
-jgh-clone-bot/
-├── bot.py                       # point d'entrée (JobQueue + handlers Telegram)
+jgh-clone-bot/                     ← dépôt du bot (orchestrateur)
+├── bot.py                         # handlers Telegram, catalogue de packs, suivi
+├── coolify_connector.py           # client API Coolify v1
 ├── db/
-│   ├── schema.sql               # DDL (§9)
-│   └── duckdb_client.py         # connexion unique stable (pattern Alert Bot)
-├── connectors/
-│   ├── coolify_connector.py     # API REST /api/v1 (create/deploy/env/delete)
-│   ├── github_connector.py      # releases, tags, checkout du code+dump
-│   └── documents_mover.py       # transport zip master → VPS déploiement (SSH/SFTP)
-├── integrations/
-│   ├── dolibarr_client.py       # RÉUTILISÉ d'Alert Bot (injection client)
-│   ├── sheets_sync.py           # RÉUTILISÉ (journal des opérations)
-│   └── calendar_sync.py         # RÉUTILISÉ (échéances)
-├── modes/
-│   ├── provision.py             # mode nominal (Coolify)
-│   ├── migrate.py               # legacy → conteneur (SSH + sentinelles)
-│   └── restore.py               # restauration depuis backup
-├── jobs/
-│   ├── job_runner.py            # exécution étape par étape + trace stdout
-│   └── catalog_sync.py          # GitHub releases → pack_versions
-├── core/
-│   ├── confirmation.py          # file pending_actions + boutons inline
-│   └── dry_run.py               # calcul et affichage du plan
-├── deploy/
-│   └── install.md               # systemd, .env (pattern Alert Bot)
-├── tests/
+│   ├── duckdb_client.py           # accès DuckDB
+│   └── schema.sql                 # schéma (migration douce)
+├── scripts/
+│   └── publish_pack.py            # publication d'un pack (artefacts)
+├── docs/                          # architecture, décisions, installation
 ├── .env.example
-└── requirements.txt
+├── requirements.txt
+└── CHANGELOG.md
+
+jgh-pack-<pack>/                   ← un dépôt par pack (compose seul)
+├── docker-compose.yml             # images ghcr.io, service dolib
+└── README.md
 ```
 
 ---
 
-## 11. Commandes Telegram (phase 1)
+## 11. Commandes Telegram
 
 | Commande | Rôle |
 |---|---|
-| `/packs` | Lister les packs et versions actives (depuis `pack_versions`) |
-| `/pack_info <pack> <version>` | Détail d'une version (changelog, modules, image Doli) |
-| `/provision <pack> <version> <client> <sous-domaine>` | Lancer un provisioning (→ dry-run + confirmation) |
-| `/jobs` | Lister les jobs récents et leur statut |
-| `/job <id>` | Détail d'un job (trace, erreurs) |
-| `/instances` | Lister les instances déployées |
-| `/migrate <source> <client> <sous-domaine>` | Migrer un client legacy (Phase 4) |
-| `/restore <instance> <backup>` | Restaurer depuis sauvegarde (Phase 5) |
-| `/sync_catalog` | Re-synchroniser le catalogue depuis GitHub |
-| `/version` | Version du bot |
+| `/packs` | Liste le catalogue de packs déployables |
+| `/provision <nom> <pack> [test]` | Déploie un pack (dry-run + confirmation) ; `test` marque une instance jetable |
+| `/instances` | Liste les instances (type 🧪/👤, statut, mise en ligne) |
+| `/delete <id>` | Résiliation (test : double bouton ; client : saisie du nom) |
+| `/cancel` | Annule une suppression client en attente |
+| `/jobs` | Déploiements récents |
+| `/job <id>` | Détail d'un déploiement (statut, UUID, log horodaté) |
+| `/version` | État du bot et de la connexion Coolify |
 
-Écritures et actions destructives réservées aux **admins** (`ADMIN_TELEGRAM_IDS`), avec confirmation ✅/❌.
+Toute action de déploiement/suppression est réservée aux admins
+(`ADMIN_TELEGRAM_IDS`).
 
 ---
 
 ## 12. Feuille de route
 
-| Phase | Contenu | Effort estimé |
-|---|---|---|
-| **0 — Cadrage & socle** | Fork structure Alert Bot, schéma DuckDB (`clone_jobs`, `pack_versions`, `pending_actions`, `instances`), figer conventions d'artefact (tag GitHub + `documents_<pack>_<version>.zip`) | 0,5–1 j |
-| **1 — Provisioning Coolify (cœur)** | VPS de test dédié, `CoolifyConnector`, `GitHubConnector`, `/provision` Telegram → dry-run → confirmation → déploiement, base MariaDB, envs `DOLI_*`, montage volume code | 3–4 j |
-| **2 — Documents & injection client** | `DocumentsMover` (zip master → VPS), injection client API Dolibarr (raison sociale, XOF, admin), journalisation Sheets/Agenda | 2 j |
-| **3 — Catalogue & module de publication** | Module Dolibarr de publication (PHP, GitHub + zip), `catalog_sync` (releases → `pack_versions`), `/packs` enrichi | 2–3 j |
-| **4 — Migration legacy → conteneur** | Mode `migrate` : dump live + sentinelles, import dans conteneur neuf | 2–3 j |
-| **5 — Cycle de vie & robustesse** | Rollback, suspension/restauration/résiliation, `restore`, jonction Alert Bot (`expires_on`) | 2 j |
-| **6 — Déclenchement commercial** | Webhook WooCommerce `order.completed`, idempotence `woo_order_id`, API appelée par Laravel | selon JG Hosting |
+**Validé et en production**
+- Provisioning d'un pack depuis le catalogue (POS), déploiement Coolify depuis
+  ghcr.io, notification de fin, gestion test/client, suppression sécurisée.
+- Repo assaini, VPS gitifié, flux `git pull` propre.
 
-Total réaliste phases 0–3 : **environ une semaine et demie** de travail effectif.
-
----
-
-## 13. Points à valider au démarrage
-
-1. **Point de montage exact de `custom/`** sur l'image Dolibarr officielle réellement déployée (§4.4) — à caler au premier déploiement test.
-2. **Payloads Coolify 4.1.2 réels** vs spec OpenAPI (§5) — valider chaque appel contre l'instance, écarts spec/réalité connus.
-3. **Format d'artefact figé** (tag GitHub + convention de nommage du zip documents) avant d'écrire la Phase 1 — c'est le point ouvert n°4 de `JG_Hosting_Synthese.md`.
-4. ~~**Repo GitHub** : un repo par pack, ou repo commun ?~~ **Tranché (§4.5) : un repo privé par pack** (`jgh-pack-<pack>`), tags semver simples, une deploy key Coolify par repo.
-5. **VPS de test** : dimensionnement et rattachement à Coolify (serveur de ressources dédié aux déploiements de test).
+**Prochains chantiers**
+- Suivi étape par étape (jalons horodatés pendant le déploiement).
+- Infos serveur : estimation instances disponibles/total selon RAM/CPU.
+- Version dev/test des packs (`-dev`, jetables 14 j/30 j).
+- Autres packs : Tambali, Asso, Pro, Immo.
+- Phase domaines : `*.s1.yessalerp.com` + SSL (préfixe serveur par VPS).
+- Déclencheur commercial : webhook WooCommerce/Laravel sur `order.completed`
+  (idempotence par `woo_order_id`), quand la couche commerciale sera branchée.
+- Collaboration Alert Bot ↔ Clone Bot.
 
 ---
 
-## 14. Principes non négociables (récapitulatif)
+## 13. Principes non négociables (récapitulatif)
 
-- **Coolify exécute, le bot orchestre** — aucune logique métier dans Coolify.
-- **Une seule image par version de Dolibarr** — jamais une image par pack ou par client.
-- **Code du pack en volume read-only, documents tenant en volume read-write** — jamais mélangés.
-- **Jamais d'action destructive silencieuse** — file `pending` + confirmation Telegram.
-- **Dry-run par défaut**, idempotence par clé de job, trace intégrale conservée.
-- **Jeton Coolify scopé** (`write`/`deploy`), jamais `root` ; secrets hors repo.
-- **Le module de publication vit dans Dolibarr**, le bot consomme le catalogue.
-- **Un repo GitHub privé par pack** (`jgh-pack-<pack>`), une deploy key Coolify par repo — jamais un repo commun.
-- **Clonage live = migration one-shot**, jamais voie de provisioning nominale.
-- **Code, messages et docs en français** · fuseau Africa/Dakar (= UTC).
-```
+- **Coolify exécute, le bot orchestre.** Jamais de SSH root large ; API scopée.
+- **Deux images cuites par pack, publiées sur ghcr.io.** Ce qui distingue un pack
+  vit dans son dump SQL et ses images, pas ailleurs.
+- **Aucun bind mount de fichier** (contournement du bug Coolify — voir
+  `DECISIONS.md`).
+- **Confirmation avant toute action destructive** ; saisie du nom pour les
+  instances client.
+- **Secrets hors repo**, français, fuseau Africa/Dakar, déploiement par git.
+- **Valider contre l'instance réelle** avant de figer un comportement d'API.
