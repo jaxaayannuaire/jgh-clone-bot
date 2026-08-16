@@ -22,6 +22,8 @@ import logging
 import os
 import time
 
+from typing import Optional
+
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -33,6 +35,10 @@ from db.duckdb_client import Database
 from coolify_connector import (
     CoolifyConnector, CoolifyConfig,
     CoolifyError, CoolifyAuthError, CoolifyDomainConflict, CoolifyNotFound,
+)
+from woo_connector import (
+    WooConnector, WooConfig, WooError, WooAuthError, WooNotFound,
+    PRODUCT_TO_PACK,
 )
 
 load_dotenv()
@@ -123,6 +129,23 @@ def build_connector() -> CoolifyConnector:
     return CoolifyConnector(cfg)
 
 
+def build_woo_connector() -> Optional[WooConnector]:
+    """Construit le connecteur WooCommerce si les clés sont configurées.
+
+    Renvoie None si non configuré (le bot fonctionne alors sans /commandes).
+    """
+    key = os.environ.get("WOO_CONSUMER_KEY", "")
+    secret = os.environ.get("WOO_CONSUMER_SECRET", "")
+    base = os.environ.get("WOO_BASE_URL", "")
+    if not (key and secret and base):
+        return None
+    cfg = WooConfig(
+        base_url=base, consumer_key=key, consumer_secret=secret,
+        timeout=int(os.environ.get("WOO_TIMEOUT", "30")),
+    )
+    return WooConnector(cfg)
+
+
 # ---------------------------------------------------------------------------
 # Commandes
 # ---------------------------------------------------------------------------
@@ -132,8 +155,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "JGH Clone Bot — provisioning Coolify.\n"
-        "Commandes : /packs · /provision <nom> <pack> [test] · /instances · "
-        "/delete <id> · /jobs · /job <id> · /version"
+        "Commandes : /packs · /commandes · /provision <nom> <pack> [test] · "
+        "/instances · /delete <id> · /jobs · /job <id> · /version"
     )
 
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,7 +347,31 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ Déploiement en cours (job #{job_id})…\n"
         f"Création de l'application Coolify.")
 
+    await _launch_deployment(
+        context, job_id=job_id, app_name=app_name,
+        deploy_key_uuid=deploy_key_uuid, service=service,
+        chat_id=query.message.chat_id, query=query)
+
+
+async def _launch_deployment(context, *, job_id, app_name, deploy_key_uuid,
+                             service, chat_id, query=None):
+    """
+    Crée l'app Coolify, déclenche le déploiement, planifie le suivi.
+    Partagé par /provision (via on_confirm) et /commandes (via on_woo_provision).
+
+    query : callback query à éditer pour les messages d'étape (optionnel ;
+            si None, on envoie de nouveaux messages via chat_id).
+    """
+    db: Database = context.bot_data["db"]
     conn: CoolifyConnector = context.bot_data["coolify"]
+    job = db.get_job(job_id)
+
+    async def _notify(txt, md=False):
+        kwargs = {"parse_mode": "Markdown"} if md else {}
+        if query is not None:
+            await query.edit_message_text(txt, **kwargs)
+        else:
+            await context.bot.send_message(chat_id, txt, **kwargs)
 
     # 1. Création
     try:
@@ -341,12 +388,12 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except CoolifyDomainConflict as e:
         db.set_job_status(job_id, "failed", error=str(e), resolved=True)
-        await query.edit_message_text(f"❌ Domaine déjà pris (job #{job_id}).")
+        await _notify(f"❌ Domaine déjà pris (job #{job_id}).")
         return
     except (CoolifyAuthError, CoolifyNotFound, CoolifyError) as e:
         db.set_job_status(job_id, "failed", error=str(e),
                           append_log=f"ERREUR create: {e}", resolved=True)
-        await query.edit_message_text(f"❌ Échec création (job #{job_id}) : {e}")
+        await _notify(f"❌ Échec création (job #{job_id}) : {e}")
         return
 
     app_uuid = resp.get("uuid")
@@ -354,8 +401,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_job_status(job_id, "failed",
                           error="Pas d'UUID dans la réponse Coolify",
                           append_log=f"réponse: {str(resp)[:400]}", resolved=True)
-        await query.edit_message_text(
-            f"❌ Création sans UUID (job #{job_id}). Voir logs.")
+        await _notify(f"❌ Création sans UUID (job #{job_id}). Voir logs.")
         return
 
     db.set_job_status(job_id, "running", app_uuid=app_uuid,
@@ -368,27 +414,20 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except CoolifyError as e:
         db.set_job_status(job_id, "failed", error=str(e),
                           append_log=f"ERREUR deploy: {e}", resolved=True)
-        await query.edit_message_text(
-            f"❌ App créée mais déploiement échoué (job #{job_id}) : {e}")
+        await _notify(f"❌ App créée mais déploiement échoué (job #{job_id}) : {e}")
         return
 
-    # 3. Déploiement déclenché → on lance le SUIVI en tâche de fond.
-    #    Le job reste 'running' ; le polling le passera à 'active' (succès)
-    #    ou 'failed' (échec), et enverra le message de fin riche.
+    # 3. Suivi en tâche de fond
     db.set_job_status(job_id, "running", append_log="suivi du déploiement lancé")
-
-    await query.edit_message_text(
+    await _notify(
         f"⏳ *Déploiement en cours* (job #{job_id})\n\n"
         f"Client : `{job['client_name']}`\n"
         f"App : `{app_name}`\n"
         f"URL : https://{job['subdomain']}/\n\n"
         f"Téléchargement des images et démarrage… "
         f"Je te préviens dès que c'est prêt.\n"
-        f"Suivi manuel : /job {job_id}",
-        parse_mode="Markdown")
+        f"Suivi manuel : /job {job_id}", md=True)
 
-    # Planifier le polling non bloquant (le bot reste réactif).
-    chat_id = query.message.chat_id
     context.job_queue.run_once(
         poll_deployment,
         when=POLL_INTERVAL_S,
@@ -764,6 +803,147 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Rien à annuler.")
 
 
+async def cmd_commandes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/commandes — liste les commandes WooCommerce 'completed' à provisionner."""
+    if not is_allowed(update):
+        return
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Réservé aux admins.")
+        return
+
+    woo: Optional[WooConnector] = context.bot_data.get("woo")
+    if woo is None:
+        await update.message.reply_text(
+            "⚠️ WooCommerce n'est pas configuré (clés API absentes du .env).")
+        return
+
+    db: Database = context.bot_data["db"]
+
+    await update.message.reply_text("🔎 Lecture des commandes WooCommerce…")
+
+    try:
+        orders = woo.list_orders(status="completed", per_page=20)
+    except WooAuthError as e:
+        await update.message.reply_text(f"🔴 Auth WooCommerce refusée : {e}")
+        return
+    except WooError as e:
+        await update.message.reply_text(f"🔴 Erreur WooCommerce : {e}")
+        return
+
+    if not orders:
+        await update.message.reply_text(
+            "Aucune commande *completed* à traiter.", parse_mode="Markdown")
+        return
+
+    # Séparer : à provisionner (pas encore de job) vs déjà fait
+    to_do = []
+    already = 0
+    for o in orders:
+        if db.job_for_woo_order(o.order_id):
+            already += 1
+        else:
+            to_do.append(o)
+
+    if not to_do:
+        await update.message.reply_text(
+            f"✅ Toutes les commandes completed récentes sont déjà "
+            f"provisionnées ({already}).")
+        return
+
+    # Afficher chaque commande à traiter avec un bouton "Déployer"
+    header = (f"🛒 *{len(to_do)} commande(s) à provisionner*"
+              f"{f' ({already} déjà faite(s))' if already else ''}\n")
+    await update.message.reply_text(header, parse_mode="Markdown")
+
+    context.bot_data.setdefault("woo_ctx", {})
+    for o in to_do:
+        pack_txt = (f"`{o.pack_key}`" if o.pack_key
+                    else f"⚠️ produit {o.product_id} non mappé")
+        sd = o.resolved_subdomain()
+        card = (
+            f"*Commande #{o.number}*\n"
+            f"Client : {o.client_label()}\n"
+            f"Tél : `{o.phone or '—'}` · {o.email or '—'}\n"
+            f"Produit : {o.product_name} → {pack_txt}\n"
+            f"Sous-domaine : `{sd}`\n"
+            f"Montant : {o.total} {o.currency}"
+        )
+        # On ne propose le bouton que si le pack est mappé
+        if o.pack_key:
+            token = f"{o.order_id}"
+            context.bot_data["woo_ctx"][token] = {
+                "order_id": o.order_id, "number": o.number,
+                "pack_key": o.pack_key, "subdomain": sd,
+                "client_name": sd,  # le nom d'instance = le sous-domaine
+            }
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🚀 Déployer",
+                                     callback_data=f"woo:{token}"),
+            ]])
+            await update.message.reply_text(card, reply_markup=kb,
+                                            parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                card + "\n\n⚠️ Pack non reconnu — vérifier le mapping produit.",
+                parse_mode="Markdown")
+
+
+async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback 'woo:<order_id>' — provisionne l'instance d'une commande."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.edit_message_text("⛔ Réservé aux admins.")
+        return
+
+    _, token = query.data.split(":", 1)
+    wctx = context.bot_data.get("woo_ctx", {}).get(token)
+    if not wctx:
+        await query.edit_message_text("⚠️ Cette commande n'est plus en attente.")
+        return
+
+    db: Database = context.bot_data["db"]
+    order_id = wctx["order_id"]
+
+    # Idempotence : refuser si déjà provisionnée
+    existing = db.job_for_woo_order(order_id)
+    if existing:
+        await query.edit_message_text(
+            f"⚠️ Commande #{wctx['number']} déjà provisionnée (job #{existing}).")
+        return
+
+    pack = PACKS.get(wctx["pack_key"])
+    if not pack or not pack["deploy_key_uuid"]:
+        await query.edit_message_text(
+            f"⚠️ Pack `{wctx['pack_key']}` indisponible (deploy key manquante).")
+        return
+
+    name = wctx["client_name"]
+    domain = f"{wctx['subdomain']}.{DOMAIN_SUFFIX}"
+    app_name = f"jgh-{name}-{wctx['pack_key']}-{int(time.time())}"
+
+    # Créer le job lié à la commande WooCommerce (instance_type=client)
+    idem = f"woo:{order_id}"
+    job_id = db.create_job(
+        client_name=name, subdomain=domain,
+        git_repository=pack["repo"], git_branch=pack["branch"],
+        idempotency_key=idem, instance_type="client",
+        woo_order_id=order_id)
+
+    context.bot_data["woo_ctx"].pop(token, None)
+
+    await query.edit_message_text(
+        f"⏳ Déploiement de la commande #{wctx['number']} (job #{job_id})…\n"
+        f"Pack `{wctx['pack_key']}` · `{domain}`",
+        parse_mode="Markdown")
+
+    # Réutiliser la logique de déploiement + suivi
+    await _launch_deployment(
+        context, job_id=job_id, app_name=app_name,
+        deploy_key_uuid=pack["deploy_key_uuid"],
+        service=pack["service"], chat_id=query.message.chat_id)
+
+
 async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -813,15 +993,18 @@ def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     db = Database(os.environ.get("DB_PATH", "clone.duckdb"))
     coolify = build_connector()
+    woo = build_woo_connector()
 
     app = Application.builder().token(token).build()
     app.bot_data["db"] = db
     app.bot_data["coolify"] = coolify
+    app.bot_data["woo"] = woo
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("version", cmd_version))
     app.add_handler(CommandHandler("packs", cmd_packs))
     app.add_handler(CommandHandler("provision", cmd_provision))
+    app.add_handler(CommandHandler("commandes", cmd_commandes))
     app.add_handler(CommandHandler("instances", cmd_instances))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
@@ -831,6 +1014,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^(ok|no):"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^(del1|delno):"))
     app.add_handler(CallbackQueryHandler(on_delete_execute, pattern=r"^del2:"))
+    app.add_handler(CallbackQueryHandler(on_woo_provision, pattern=r"^woo:"))
     # Saisie du nom pour la suppression CLIENT (texte hors commande)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, on_delete_name_reply))

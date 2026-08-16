@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS clone_jobs (
     git_branch VARCHAR,
     coolify_app_uuid VARCHAR,                       -- UUID de l'app créée
     instance_type VARCHAR DEFAULT 'client',         -- client|test (gouverne la suppression)
+    woo_order_id INTEGER,                            -- commande WooCommerce liée (idempotence)
     status VARCHAR DEFAULT 'pending',               -- pending|confirmed|running|active|failed|deleted
     dry_run BOOLEAN DEFAULT TRUE,
     stdout_log TEXT,                                -- trace des étapes
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS clone_jobs (
 -- Migration douce : ajouter les colonnes si la table préexiste sans elles.
 -- DuckDB supporte ADD COLUMN IF NOT EXISTS.
 ALTER TABLE clone_jobs ADD COLUMN IF NOT EXISTS instance_type VARCHAR DEFAULT 'client';
+ALTER TABLE clone_jobs ADD COLUMN IF NOT EXISTS woo_order_id INTEGER;
 ALTER TABLE clone_jobs ADD COLUMN IF NOT EXISTS online_at TIMESTAMP;
 ALTER TABLE clone_jobs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
 

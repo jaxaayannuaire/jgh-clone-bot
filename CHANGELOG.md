@@ -3,6 +3,34 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.5.0] - 2026-08-16
+
+Intégration WooCommerce (lecture) : provisionner depuis les commandes.
+
+### Added
+- `WooConnector` : client de l'API REST WooCommerce (lecture) — lit les
+  commandes, normalise client/produit/meta en objets exploitables.
+- Commande `/commandes` : liste les commandes WooCommerce `completed` non encore
+  provisionnées, avec un bouton « 🚀 Déployer » par commande.
+- Mapping produit WooCommerce → pack (3508→tambali, 3562→pos, 3566→asso,
+  3581→pro).
+- Cascade de génération du sous-domaine : sous-domaine saisi → société →
+  activité → `cmd<numéro>` (dernier recours toujours unique).
+- Idempotence par commande : `woo_order_id` sur le job ; une commande ne peut
+  être provisionnée qu'une fois (sauf si le job précédent a échoué).
+- Fonction de déploiement partagée `_launch_deployment` réutilisée par
+  `/provision` et `/commandes` (création + déploiement + suivi de fin).
+
+### Changed
+- Schéma DuckDB : colonne `woo_order_id` (migration douce).
+- `create_job` et `get_job` gèrent le lien vers la commande WooCommerce.
+
+### Notes
+- Étape 1 = LECTURE SEULE : le bot lit et provisionne. La validation d'une
+  commande (passage à `completed`) et la création de commandes terrain
+  (vente hors-ligne) viendront en étape 2 avec une clé API en écriture.
+- WooCommerce + Woo Subscriptions restent la source de vérité commerciale.
+
 ## [0.4.0] - 2026-08-16
 
 Gestion des instances : suppression et inventaire.

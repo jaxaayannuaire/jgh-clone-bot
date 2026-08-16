@@ -47,32 +47,46 @@ class Database:
     def create_job(self, client_name: str, subdomain: str,
                    git_repository: str, git_branch: str,
                    idempotency_key: str,
-                   instance_type: str = "client") -> int:
+                   instance_type: str = "client",
+                   woo_order_id: Optional[int] = None) -> int:
         job_id = self._con.execute(
             "SELECT nextval('seq_clone_jobs')"
         ).fetchone()[0]
         self._con.execute(
             """INSERT INTO clone_jobs
                (id, job_type, idempotency_key, client_name, subdomain,
-                git_repository, git_branch, instance_type, status, dry_run)
-               VALUES (?, 'provision', ?, ?, ?, ?, ?, ?, 'pending', TRUE)""",
+                git_repository, git_branch, instance_type, woo_order_id,
+                status, dry_run)
+               VALUES (?, 'provision', ?, ?, ?, ?, ?, ?, ?, 'pending', TRUE)""",
             [job_id, idempotency_key, client_name, subdomain,
-             git_repository, git_branch, instance_type],
+             git_repository, git_branch, instance_type, woo_order_id],
         )
         return job_id
+
+    def job_for_woo_order(self, woo_order_id: int) -> Optional[int]:
+        """
+        Renvoie l'id du job lié à une commande WooCommerce donnée, s'il existe
+        et n'est pas annulé/échoué (idempotence : une commande = une instance).
+        """
+        row = self.fetchone(
+            """SELECT id FROM clone_jobs
+               WHERE woo_order_id = ?
+                 AND status NOT IN ('failed', 'deleted')
+               ORDER BY id DESC LIMIT 1""", [woo_order_id])
+        return row[0] if row else None
 
     def get_job(self, job_id: int) -> Optional[dict]:
         row = self.fetchone(
             """SELECT id, job_type, client_name, subdomain, git_repository,
-                      git_branch, coolify_app_uuid, instance_type, status,
-                      error_message, stdout_log, created_at, online_at,
+                      git_branch, coolify_app_uuid, instance_type, woo_order_id,
+                      status, error_message, stdout_log, created_at, online_at,
                       resolved_at, deleted_at
                FROM clone_jobs WHERE id = ?""", [job_id])
         if not row:
             return None
         keys = ["id", "job_type", "client_name", "subdomain", "git_repository",
-                "git_branch", "coolify_app_uuid", "instance_type", "status",
-                "error_message", "stdout_log", "created_at", "online_at",
+                "git_branch", "coolify_app_uuid", "instance_type", "woo_order_id",
+                "status", "error_message", "stdout_log", "created_at", "online_at",
                 "resolved_at", "deleted_at"]
         return dict(zip(keys, row))
 
