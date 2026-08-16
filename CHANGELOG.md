@@ -3,6 +3,33 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.4.0] - 2026-08-16
+
+Gestion des instances : suppression et inventaire.
+
+### Added
+- Commande `/delete <id>` : résiliation d'une instance (application + données).
+  - Instance **test** : double confirmation par boutons.
+  - Instance **client** : saisie du nom exact pour confirmer (façon Coolify).
+  - Notification de fin « ✅ suppression réussie » (ou 🔴 échec).
+- Commande `/instances` : liste les instances déployées avec leur type
+  (🧪 test / 👤 client), statut (🟢 en ligne, ⏳ en cours, 🔴 échec) et date
+  de mise en ligne.
+- Commande `/cancel` : annule une suppression client en attente de saisie.
+- Notion de **type d'instance** (`client` par défaut, `test` via le mot-clé
+  `test` dans `/provision`) : gouverne le niveau de confirmation à la suppression.
+- Horodatage de mise en ligne (`online_at`) et de suppression (`deleted_at`).
+
+### Changed
+- `/provision <nom> <pack> [test]` : le mot-clé `test` marque une instance de test.
+- Schéma DuckDB étendu (migration douce `ADD COLUMN IF NOT EXISTS`) : colonnes
+  `instance_type`, `online_at`, `deleted_at`. Les bases existantes sont migrées
+  sans perte au démarrage.
+
+### Security
+- Suppression d'une instance client protégée par saisie du nom exact.
+- Refus de supprimer un déploiement encore en cours (statut running/pending).
+
 ## [0.3.0] - 2026-08-15
 
 Notification automatique de fin de déploiement.

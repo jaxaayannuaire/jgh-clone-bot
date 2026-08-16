@@ -25,7 +25,8 @@ import time
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    filters, ContextTypes,
 )
 
 from db.duckdb_client import Database
@@ -131,7 +132,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "JGH Clone Bot — provisioning Coolify.\n"
-        "Commandes : /packs · /provision <nom> <pack> · /jobs · /job <id> · /version"
+        "Commandes : /packs · /provision <nom> <pack> [test] · /instances · "
+        "/delete <id> · /jobs · /job <id> · /version"
     )
 
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,13 +175,23 @@ async def cmd_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = args[0].strip().lower()
 
-    # Résolution du pack : 2e argument s'il correspond à une clé du catalogue,
-    # sinon on prend le pack par défaut (et le 2e arg est alors le domaine).
+    # Le mot-clé 'test' (n'importe où après le nom) marque une instance de test.
+    # On le retire des args avant de résoudre pack/domaine.
+    raw_rest = [a.strip() for a in args[1:]]
+    instance_type = "client"
+    if "test" in [a.lower() for a in raw_rest]:
+        instance_type = "test"
+        raw_rest = [a for a in raw_rest if a.lower() != "test"]
+
+    # Résolution du pack : 1er reste s'il correspond à une clé du catalogue,
+    # sinon on prend le pack par défaut (et le reste est alors le domaine).
     pack_key = DEFAULT_PACK
-    domain_arg_index = 1
-    if len(args) > 1 and args[1].strip().lower() in PACKS:
-        pack_key = args[1].strip().lower()
-        domain_arg_index = 2
+    domain_val = None
+    if raw_rest and raw_rest[0].lower() in PACKS:
+        pack_key = raw_rest[0].lower()
+        domain_val = raw_rest[1] if len(raw_rest) > 1 else None
+    elif raw_rest:
+        domain_val = raw_rest[0]
 
     pack = PACKS.get(pack_key)
     if not pack:
@@ -198,9 +210,7 @@ async def cmd_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Nom d'app Coolify : préfixe + pack + horodatage (évite les collisions)
     app_name = f"jgh-{name}-{pack_key}-{int(time.time())}"
     # Domaine : fourni en argument, ou dérivé du nom sur le suffixe
-    domain = (args[domain_arg_index].strip()
-              if len(args) > domain_arg_index
-              else f"{name}.{DOMAIN_SUFFIX}")
+    domain = domain_val.strip() if domain_val else f"{name}.{DOMAIN_SUFFIX}"
 
     db: Database = context.bot_data["db"]
 
@@ -217,11 +227,13 @@ async def cmd_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job_id = db.create_job(
         client_name=name, subdomain=domain,
         git_repository=pack["repo"], git_branch=pack["branch"],
-        idempotency_key=idem)
+        idempotency_key=idem, instance_type=instance_type)
 
+    type_badge = "🧪 TEST" if instance_type == "test" else "👤 CLIENT"
     plan = (
         f"📋 *Plan de déploiement* (dry-run)\n\n"
         f"Job #{job_id}\n"
+        f"Type : {type_badge}\n"
         f"Client : `{name}`\n"
         f"Pack : `{pack_key}` — {pack['label']} v{pack['version']}\n"
         f"Nom app : `{app_name}`\n"
@@ -492,6 +504,266 @@ async def poll_deployment(context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
 
+async def cmd_instances(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/instances — liste les instances déployées avec type, statut, mise en ligne."""
+    if not is_allowed(update):
+        return
+    db: Database = context.bot_data["db"]
+    instances = db.list_instances(30)
+    if not instances:
+        await update.message.reply_text("Aucune instance déployée.")
+        return
+
+    status_icons = {"active": "🟢 en ligne", "running": "⏳ en cours",
+                    "failed": "🔴 échec", "deleted": "🗑️ supprimée"}
+    lines = ["*Instances déployées*\n"]
+    for it in instances:
+        type_badge = "🧪" if it["instance_type"] == "test" else "👤"
+        etat = status_icons.get(it["status"], it["status"])
+        # Date de mise en ligne (online_at), sinon création
+        when = it["online_at"] or it["created_at"]
+        when_str = str(when)[:16] if when else "—"
+        lines.append(
+            f"{type_badge} #{it['id']} `{it['client_name']}` — {etat}\n"
+            f"   `{it['subdomain']}`\n"
+            f"   en ligne : {when_str}")
+    lines.append("\nSupprimer : /delete <id>")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delete <id> — supprime une instance (résiliation, données comprises).
+
+    Instance TEST   → double confirmation par boutons.
+    Instance CLIENT → saisie du nom exact pour confirmer (façon Coolify).
+    """
+    if not is_allowed(update):
+        return
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Réservé aux admins.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage : /delete <id>\n"
+            "L'id est celui d'un job/instance (voir /instances ou /jobs).")
+        return
+
+    try:
+        job_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("L'id doit être un nombre. Ex : /delete 6")
+        return
+
+    db: Database = context.bot_data["db"]
+    job = db.get_job(job_id)
+    if not job:
+        await update.message.reply_text(f"Job #{job_id} introuvable.")
+        return
+
+    # Garde-fous
+    if not job.get("coolify_app_uuid"):
+        await update.message.reply_text(
+            f"⚠️ Le job #{job_id} n'a pas d'application Coolify associée "
+            f"(rien à supprimer côté infra).")
+        return
+    if job["status"] == "deleted":
+        await update.message.reply_text(
+            f"⚠️ L'instance #{job_id} est déjà supprimée.")
+        return
+    if job["status"] in ("running", "confirmed", "pending"):
+        await update.message.reply_text(
+            f"⚠️ Le déploiement #{job_id} est encore en cours (statut "
+            f"`{job['status']}`). Attends la fin avant de supprimer.",
+            parse_mode="Markdown")
+        return
+
+    itype = job.get("instance_type", "client")
+    app_uuid = job["coolify_app_uuid"]
+
+    if itype == "test":
+        # --- Flux TEST : double confirmation par boutons ---
+        pending_id = db.create_pending(job_id, "delete",
+                                       f"delete test #{job_id}")
+        context.bot_data.setdefault("delete_ctx", {})[pending_id] = {
+            "job_id": job_id, "app_uuid": app_uuid,
+            "name": job["client_name"], "domain": job["subdomain"],
+        }
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑️ Supprimer", callback_data=f"del1:{pending_id}"),
+            InlineKeyboardButton("❌ Annuler", callback_data=f"delno:{pending_id}"),
+        ]])
+        await update.message.reply_text(
+            f"🧪 *Suppression d'une instance de TEST*\n\n"
+            f"Job #{job_id} — `{job['client_name']}`\n"
+            f"Domaine : `{job['subdomain']}`\n\n"
+            f"⚠️ L'application et ses *données* seront supprimées "
+            f"définitivement.\n"
+            f"Confirmer ?",
+            reply_markup=kb, parse_mode="Markdown")
+    else:
+        # --- Flux CLIENT : saisie du nom exact (façon Coolify) ---
+        # On mémorise l'attente d'une saisie de confirmation pour cet admin.
+        uid = update.effective_user.id
+        context.bot_data.setdefault("delete_await", {})[uid] = {
+            "job_id": job_id, "app_uuid": app_uuid,
+            "name": job["client_name"], "domain": job["subdomain"],
+        }
+        await update.message.reply_text(
+            f"👤 *Suppression d'une instance CLIENT*\n\n"
+            f"Job #{job_id} — `{job['client_name']}`\n"
+            f"Domaine : `{job['subdomain']}`\n\n"
+            f"⚠️ *Action irréversible* : l'application et toutes les "
+            f"*données du client* seront définitivement perdues.\n\n"
+            f"Pour confirmer, envoie exactement le nom de l'instance :\n"
+            f"`{job['client_name']}`\n\n"
+            f"Ou /cancel pour annuler.",
+            parse_mode="Markdown")
+
+
+async def on_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callbacks de la suppression d'instance TEST (boutons)."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.edit_message_text("⛔ Réservé aux admins.")
+        return
+
+    action, pid_str = query.data.split(":", 1)
+    pending_id = int(pid_str)
+    db: Database = context.bot_data["db"]
+    dctx = context.bot_data.get("delete_ctx", {}).get(pending_id)
+
+    if not dctx:
+        await query.edit_message_text("⚠️ Cette demande n'est plus valide.")
+        return
+
+    if action == "delno":
+        db.resolve_pending(pending_id, "rejected")
+        context.bot_data["delete_ctx"].pop(pending_id, None)
+        await query.edit_message_text(
+            f"❌ Suppression annulée (job #{dctx['job_id']}).")
+        return
+
+    # action == "del1" : premier bouton cliqué → SECONDE confirmation
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚠️ Oui, supprimer définitivement",
+                             callback_data=f"del2:{pending_id}"),
+        InlineKeyboardButton("❌ Non", callback_data=f"delno:{pending_id}"),
+    ]])
+    await query.edit_message_text(
+        f"⚠️ *Confirmation finale*\n\n"
+        f"Supprimer définitivement l'instance de test "
+        f"`{dctx['name']}` (job #{dctx['job_id']}) et ses données ?\n\n"
+        f"Cette action est *irréversible*.",
+        reply_markup=kb, parse_mode="Markdown")
+
+
+async def on_delete_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback del2 : exécution effective de la suppression (test)."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.edit_message_text("⛔ Réservé aux admins.")
+        return
+
+    _, pid_str = query.data.split(":", 1)
+    pending_id = int(pid_str)
+    db: Database = context.bot_data["db"]
+    dctx = context.bot_data.get("delete_ctx", {}).get(pending_id)
+    if not dctx:
+        await query.edit_message_text("⚠️ Cette demande n'est plus valide.")
+        return
+
+    db.resolve_pending(pending_id, "confirmed")
+    context.bot_data["delete_ctx"].pop(pending_id, None)
+    await _do_delete(update, context, dctx, edit=True)
+
+
+async def on_delete_name_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """MessageHandler : capture la saisie du nom pour les suppressions CLIENT."""
+    if not is_admin(update):
+        return
+    uid = update.effective_user.id
+    awaiting = context.bot_data.get("delete_await", {}).get(uid)
+    if not awaiting:
+        return  # Pas de suppression client en attente pour cet utilisateur
+
+    text = (update.message.text or "").strip()
+
+    if text.lower() == "/cancel":
+        context.bot_data["delete_await"].pop(uid, None)
+        await update.message.reply_text(
+            f"❌ Suppression annulée (job #{awaiting['job_id']}).")
+        return
+
+    if text != awaiting["name"]:
+        await update.message.reply_text(
+            f"⚠️ Le nom ne correspond pas. Suppression *non* effectuée.\n"
+            f"Attendu : `{awaiting['name']}`\n"
+            f"Réessaie /delete {awaiting['job_id']} ou /cancel.",
+            parse_mode="Markdown")
+        context.bot_data["delete_await"].pop(uid, None)
+        return
+
+    # Nom correct → exécution
+    context.bot_data["delete_await"].pop(uid, None)
+    await _do_delete(update, context, awaiting, edit=False)
+
+
+async def _do_delete(update, context, dctx: dict, edit: bool):
+    """Exécute la suppression Coolify + met à jour la base + notifie."""
+    db: Database = context.bot_data["db"]
+    conn: CoolifyConnector = context.bot_data["coolify"]
+    job_id = dctx["job_id"]
+    app_uuid = dctx["app_uuid"]
+
+    async def _say(txt):
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(txt, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(txt, parse_mode="Markdown")
+
+    await _say(f"⏳ Suppression en cours (job #{job_id})…")
+
+    try:
+        conn.delete(app_uuid, delete_volumes=True)
+    except CoolifyNotFound:
+        # L'app n'existe déjà plus côté Coolify : on considère la suppression
+        # comme effective et on met la base en cohérence.
+        db.mark_deleted(job_id, append_log="app déjà absente côté Coolify")
+        await _say(
+            f"✅ *Instance supprimée* (job #{job_id})\n\n"
+            f"L'application n'existait plus côté Coolify ; la base a été "
+            f"mise à jour.")
+        return
+    except (CoolifyAuthError, CoolifyError) as e:
+        db.set_job_status(job_id, db.get_job(job_id)["status"],
+                          append_log=f"ERREUR suppression: {e}")
+        await _say(f"🔴 Échec de la suppression (job #{job_id}) : {e}")
+        return
+
+    db.mark_deleted(job_id, append_log="suppression Coolify réussie (volumes inclus)")
+    await _say(
+        f"✅ *Suppression réussie* (job #{job_id})\n\n"
+        f"Instance : `{dctx['name']}`\n"
+        f"Domaine : `{dctx['domain']}`\n"
+        f"L'application et ses données ont été supprimées.")
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cancel — annule une saisie de confirmation de suppression en attente."""
+    if not is_allowed(update):
+        return
+    uid = update.effective_user.id
+    awaiting = context.bot_data.get("delete_await", {}).pop(uid, None)
+    if awaiting:
+        await update.message.reply_text(
+            f"❌ Suppression annulée (job #{awaiting['job_id']}).")
+    else:
+        await update.message.reply_text("Rien à annuler.")
+
+
 async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -550,9 +822,18 @@ def main():
     app.add_handler(CommandHandler("version", cmd_version))
     app.add_handler(CommandHandler("packs", cmd_packs))
     app.add_handler(CommandHandler("provision", cmd_provision))
+    app.add_handler(CommandHandler("instances", cmd_instances))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("job", cmd_job))
+    # Callbacks : provision (ok/no), suppression test (del1/delno, del2)
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^(ok|no):"))
+    app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^(del1|delno):"))
+    app.add_handler(CallbackQueryHandler(on_delete_execute, pattern=r"^del2:"))
+    # Saisie du nom pour la suppression CLIENT (texte hors commande)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, on_delete_name_reply))
 
     # Garde-fou : le suivi de déploiement repose sur job_queue, qui n'existe
     # que si python-telegram-bot est installé avec l'extra [job-queue].

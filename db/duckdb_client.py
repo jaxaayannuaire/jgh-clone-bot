@@ -46,31 +46,34 @@ class Database:
 
     def create_job(self, client_name: str, subdomain: str,
                    git_repository: str, git_branch: str,
-                   idempotency_key: str) -> int:
+                   idempotency_key: str,
+                   instance_type: str = "client") -> int:
         job_id = self._con.execute(
             "SELECT nextval('seq_clone_jobs')"
         ).fetchone()[0]
         self._con.execute(
             """INSERT INTO clone_jobs
                (id, job_type, idempotency_key, client_name, subdomain,
-                git_repository, git_branch, status, dry_run)
-               VALUES (?, 'provision', ?, ?, ?, ?, ?, 'pending', TRUE)""",
+                git_repository, git_branch, instance_type, status, dry_run)
+               VALUES (?, 'provision', ?, ?, ?, ?, ?, ?, 'pending', TRUE)""",
             [job_id, idempotency_key, client_name, subdomain,
-             git_repository, git_branch],
+             git_repository, git_branch, instance_type],
         )
         return job_id
 
     def get_job(self, job_id: int) -> Optional[dict]:
         row = self.fetchone(
             """SELECT id, job_type, client_name, subdomain, git_repository,
-                      git_branch, coolify_app_uuid, status, error_message,
-                      stdout_log, created_at, resolved_at
+                      git_branch, coolify_app_uuid, instance_type, status,
+                      error_message, stdout_log, created_at, online_at,
+                      resolved_at, deleted_at
                FROM clone_jobs WHERE id = ?""", [job_id])
         if not row:
             return None
         keys = ["id", "job_type", "client_name", "subdomain", "git_repository",
-                "git_branch", "coolify_app_uuid", "status", "error_message",
-                "stdout_log", "created_at", "resolved_at"]
+                "git_branch", "coolify_app_uuid", "instance_type", "status",
+                "error_message", "stdout_log", "created_at", "online_at",
+                "resolved_at", "deleted_at"]
         return dict(zip(keys, row))
 
     def recent_jobs(self, limit: int = 10) -> list[dict]:
@@ -105,9 +108,43 @@ class Database:
         if status == "confirmed":
             sets.append("confirmed_at = current_timestamp")
             sets.append("dry_run = FALSE")
+        if status == "active":
+            # Mise en ligne : on horodate le premier passage à 'active'.
+            sets.append("online_at = COALESCE(online_at, current_timestamp)")
         params.append(job_id)
         self._con.execute(
             f"UPDATE clone_jobs SET {', '.join(sets)} WHERE id = ?", params)
+
+    def mark_deleted(self, job_id: int, append_log: Optional[str] = None) -> None:
+        """Marque un job comme supprimé (statut 'deleted' + horodatage)."""
+        sets = ["status = 'deleted'", "deleted_at = current_timestamp",
+                "resolved_at = current_timestamp"]
+        params: list[Any] = []
+        if append_log is not None:
+            sets.append("stdout_log = COALESCE(stdout_log,'') || ?")
+            params.append(append_log + "\n")
+        params.append(job_id)
+        self._con.execute(
+            f"UPDATE clone_jobs SET {', '.join(sets)} WHERE id = ?", params)
+
+    def list_instances(self, limit: int = 30,
+                       include_deleted: bool = False) -> list[dict]:
+        """
+        Liste les instances déployées (jobs ayant une app Coolify), avec leur
+        type, statut et date de mise en ligne. Par défaut, masque les
+        instances supprimées.
+        """
+        where = "WHERE coolify_app_uuid IS NOT NULL"
+        if not include_deleted:
+            where += " AND status != 'deleted'"
+        rows = self.fetchall(
+            f"""SELECT id, client_name, subdomain, instance_type, status,
+                       online_at, created_at
+                FROM clone_jobs {where}
+                ORDER BY id DESC LIMIT ?""", [limit])
+        keys = ["id", "client_name", "subdomain", "instance_type", "status",
+                "online_at", "created_at"]
+        return [dict(zip(keys, r)) for r in rows]
 
     # -- pending_actions ----------------------------------------------------
 
