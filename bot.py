@@ -158,6 +158,12 @@ def build_product_mapping() -> dict[int, str]:
 POLL_INTERVAL_S = int(os.environ.get("POLL_INTERVAL_S", "15"))
 # Délai maximal de suivi ; au-delà, on prévient sans conclure (⚠️).
 POLL_TIMEOUT_S = int(os.environ.get("POLL_TIMEOUT_S", str(12 * 60)))
+# Après la fin du déploiement Coolify, le conteneur peut encore démarrer
+# (MariaDB importe le dump, Dolibarr boote). On accorde un délai de grâce :
+# GRACE_MAX_ATTEMPTS vérifications espacées de POLL_INTERVAL_S avant de
+# conclure à l'échec. 8 × 15 s = 2 min de grâce (le 1er déploiement d'un pack
+# dure ~1min30, les suivants ~30 s).
+GRACE_MAX_ATTEMPTS = int(os.environ.get("GRACE_MAX_ATTEMPTS", "8"))
 # Version de Dolibarr des packs (affichée dans le message de fin).
 DOLIBARR_VERSION = os.environ.get("DOLIBARR_VERSION", "22.0.4")
 
@@ -496,6 +502,7 @@ async def _launch_deployment(context, *, job_id, app_name, deploy_key_uuid,
             "chat_id": chat_id,
             "started_at": time.time(),
             "attempts": 0,
+            "grace_attempts": 0,
         },
         name=f"poll_job_{job_id}",
     )
@@ -569,7 +576,10 @@ async def poll_deployment(context: ContextTypes.DEFAULT_TYPE):
             name=f"poll_job_{job_id}")
         return
 
-    # 3. Le déploiement a disparu de /deployments → terminé. Succès ou échec ?
+    # 3. Le déploiement a disparu de /deployments → terminé côté Coolify.
+    #    MAIS le conteneur peut encore démarrer (MariaDB importe le dump, puis
+    #    Dolibarr boote). On accorde un DÉLAI DE GRÂCE : tant que l'app n'est pas
+    #    'running', on retente quelques fois avant de conclure à l'échec.
     running = conn.application_is_running(app_uuid)
     duree = _human_duration(elapsed)
 
@@ -585,19 +595,39 @@ async def poll_deployment(context: ContextTypes.DEFAULT_TYPE):
             f"⏱️ Déployée en {duree}\n\n"
             f"🔗 Détails : /job {job_id}",
             parse_mode="Markdown")
-    else:
+        return
+
+    # Pas encore 'running' : phase de grâce (le conteneur démarre peut-être).
+    grace_attempts = data.get("grace_attempts", 0) + 1
+    if grace_attempts <= GRACE_MAX_ATTEMPTS:
+        logger.info(
+            "poll job #%d : déploiement fini mais app pas encore running, "
+            "grâce %d/%d", job_id, grace_attempts, GRACE_MAX_ATTEMPTS)
         db.set_job_status(
-            job_id, "failed",
-            error="L'application n'est pas 'running' après le déploiement",
-            append_log=f"échec constaté après {duree}", resolved=True)
-        await context.bot.send_message(
-            chat_id,
-            f"🔴 *Déploiement bloqué* (job #{job_id})\n\n"
-            f"L'application n'a pas démarré correctement après {duree}.\n"
-            f"URL prévue : https://{domain}/\n\n"
-            f"🔗 Diagnostic : /job {job_id}\n"
-            f"Vérifie les logs du déploiement dans Coolify.",
-            parse_mode="Markdown")
+            job_id, "running",
+            append_log=f"attente démarrage conteneur (grâce {grace_attempts}"
+                       f"/{GRACE_MAX_ATTEMPTS})")
+        data["attempts"] = attempts
+        data["grace_attempts"] = grace_attempts
+        context.job_queue.run_once(
+            poll_deployment, when=POLL_INTERVAL_S, data=data,
+            name=f"poll_job_{job_id}")
+        return
+
+    # Délai de grâce épuisé : là on conclut vraiment à l'échec.
+    db.set_job_status(
+        job_id, "failed",
+        error="L'application n'est pas 'running' après le déploiement "
+              "et le délai de grâce",
+        append_log=f"échec constaté après {duree} (grâce épuisée)", resolved=True)
+    await context.bot.send_message(
+        chat_id,
+        f"🔴 *Déploiement bloqué* (job #{job_id})\n\n"
+        f"L'application n'a pas démarré correctement après {duree}.\n"
+        f"URL prévue : https://{domain}/\n\n"
+        f"🔗 Diagnostic : /job {job_id}\n"
+        f"Vérifie les logs du déploiement dans Coolify.",
+        parse_mode="Markdown")
 
 
 async def cmd_instances(update: Update, context: ContextTypes.DEFAULT_TYPE):

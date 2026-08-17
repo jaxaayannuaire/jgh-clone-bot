@@ -3,6 +3,18 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.5.1] - 2026-08-17
+
+Correctif : faux « déploiement bloqué ».
+
+### Fixed
+- Le suivi de déploiement concluait à tort à un échec quand le déploiement
+  Coolify était terminé mais que le conteneur démarrait encore (MariaDB importe
+  le dump, Dolibarr boote). Ajout d'un **délai de grâce** (`GRACE_MAX_ATTEMPTS`,
+  8 tentatives × 15 s = 2 min) : le bot attend que l'application devienne
+  `running` avant de conclure. Le 1er déploiement d'un pack (~1min30) n'est plus
+  signalé « bloqué » par erreur.
+
 ## [0.5.0] - 2026-08-16
 
 Intégration WooCommerce (lecture) : provisionner depuis les commandes.
