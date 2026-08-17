@@ -1024,12 +1024,14 @@ async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(query, "⚠️ WooCommerce n'est pas configuré.")
         return
 
-    # Idempotence : refuser si déjà provisionnée (job actif ou réussi)
+    # Idempotence + anti-double-clic : réservation atomique de la commande.
+    # Si un job actif existe déjà, on ne crée rien (évite les jobs fantômes
+    # créés par des clics multiples).
     existing = db.job_for_woo_order(order_id)
     if existing:
         await _safe_edit(
             query,
-            f"⚠️ Commande #{order_id} déjà provisionnée (job #{existing}).\n"
+            f"⚠️ Commande #{order_id} déjà en cours ou déployée (job #{existing}).\n"
             f"Pour redéployer, supprime d'abord l'instance : /delete {existing}")
         return
 
@@ -1065,21 +1067,35 @@ async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     domain = f"{subdomain}.{DOMAIN_SUFFIX}"
     app_name = f"jgh-{name}-{order.pack_key}-{int(time.time())}"
 
-    # Créer le job lié à la commande WooCommerce (instance_type=client)
-    idem = f"woo:{order_id}"
-    job_id = db.create_job(
-        client_name=name, subdomain=domain,
-        git_repository=pack["repo"], git_branch=pack["branch"],
-        idempotency_key=idem, instance_type="client",
-        woo_order_id=order_id)
+    # RÉSERVATION ATOMIQUE : crée le job seulement si aucun job actif n'existe.
+    # Protège contre le double-clic (deux clics rapprochés ne créent qu'un job).
+    created_id, existing_id = db.try_claim_woo_order(
+        woo_order_id=order_id, client_name=name, subdomain=domain,
+        git_repository=pack["repo"], git_branch=pack["branch"])
+
+    if existing_id is not None:
+        # Un autre clic a déjà réservé cette commande entre-temps.
+        await _safe_edit(
+            query,
+            f"⚠️ Commande #{order_id} déjà prise en charge (job #{existing_id}). "
+            f"Un seul déploiement par commande.")
+        return
+
+    job_id = created_id
+
+    # Retirer le bouton du message d'origine (évite les reclics visuels)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     # Nettoyer le cache mémoire si présent (best effort)
     context.bot_data.get("woo_ctx", {}).pop(token, None)
 
-    await _safe_edit(
-        query,
+    await query.message.reply_text(
         f"⏳ Déploiement de la commande #{order.number} (job #{job_id})…\n"
-        f"Pack `{order.pack_key}` · `{domain}`")
+        f"Pack `{order.pack_key}` · `{domain}`",
+        parse_mode="Markdown")
 
     # Réutiliser la logique de déploiement + suivi
     await _launch_deployment(

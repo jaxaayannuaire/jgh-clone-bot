@@ -3,6 +3,20 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.5.3] - 2026-08-17
+
+Correctif : double-clic sur « Déployer » créant des jobs fantômes.
+
+### Fixed
+- Cliquer plusieurs fois sur « Déployer » (notamment quand le bot semblait ne
+  pas répondre) créait plusieurs jobs pour une même commande. Ajout d'une
+  réservation atomique (`try_claim_woo_order`) : une commande ne peut avoir
+  qu'un seul job actif à la fois, quels que soient les clics simultanés.
+- Le bouton « Déployer » est retiré du message dès le premier clic pris en
+  compte, pour éviter les reclics.
+- Idempotency_key des déploiements WooCommerce rendue unique par suffixe (uuid
+  court) : permet un re-déploiement après échec/suppression sans collision.
+
 ## [0.5.2] - 2026-08-17
 
 Correctif : bouton « Déployer » des commandes robuste au redémarrage.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -74,6 +75,40 @@ class Database:
                  AND status NOT IN ('failed', 'deleted')
                ORDER BY id DESC LIMIT 1""", [woo_order_id])
         return row[0] if row else None
+
+    def try_claim_woo_order(self, woo_order_id: int, client_name: str,
+                            subdomain: str, git_repository: str,
+                            git_branch: str) -> tuple[Optional[int], Optional[int]]:
+        """
+        Tente de créer ATOMIQUEMENT un job pour une commande WooCommerce.
+
+        Anti-double-clic : si un job actif (pending/running/active) existe déjà
+        pour cette commande, on ne crée rien et on renvoie son id comme
+        "existant". Sinon on crée le job et on renvoie son id comme "créé".
+
+        Renvoie un tuple (created_id, existing_id) :
+          - (job_id, None)  → job nouvellement créé, on peut déployer
+          - (None, job_id)  → un job actif existe déjà, NE PAS déployer
+        La sérialisation vient de la connexion DuckDB unique (mono-thread) :
+        deux appels ne s'entrelacent pas au milieu de ce bloc.
+        """
+        # 1. Un job actif existe déjà ? (verrou logique)
+        existing = self.job_for_woo_order(woo_order_id)
+        if existing is not None:
+            return (None, existing)
+
+        # 2. Aucun job actif : on en crée un. L'idempotency_key inclut un
+        #    suffixe unique (uuid court) pour permettre un re-déploiement après
+        #    échec/suppression sans collision avec l'ancienne clé (contrainte
+        #    UNIQUE), même si les deux surviennent dans la même seconde.
+        import uuid
+        idem = f"woo:{woo_order_id}:{uuid.uuid4().hex[:8]}"
+        job_id = self.create_job(
+            client_name=client_name, subdomain=subdomain,
+            git_repository=git_repository, git_branch=git_branch,
+            idempotency_key=idem, instance_type="client",
+            woo_order_id=woo_order_id)
+        return (job_id, None)
 
     def get_job(self, job_id: int) -> Optional[dict]:
         row = self.fetchone(
