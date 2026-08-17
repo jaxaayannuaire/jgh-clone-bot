@@ -3,6 +3,24 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.5.2] - 2026-08-17
+
+Correctif : bouton « Déployer » des commandes robuste au redémarrage.
+
+### Fixed
+- Le bouton « Déployer » d'une commande ne réagissait plus après un
+  redémarrage du bot (les données du bouton étaient en mémoire vive, perdues
+  au restart). Le callback relit désormais la commande directement depuis
+  WooCommerce à partir de l'order_id (contenu dans le bouton) — plus aucune
+  dépendance au cache mémoire.
+- Retours du callback plus fiables : repli sur un nouveau message si l'édition
+  du message d'origine échoue (message trop ancien), et alertes popup pour les
+  refus. Le bouton donne toujours un retour visible.
+
+### Changed
+- Idempotence plus explicite : si une commande est déjà provisionnée, le bot
+  indique le job et propose /delete pour redéployer.
+
 ## [0.5.1] - 2026-08-17
 
 Correctif : faux « déploiement bloqué ».

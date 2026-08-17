@@ -999,38 +999,71 @@ async def cmd_commandes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback 'woo:<order_id>' — provisionne l'instance d'une commande."""
+    """Callback 'woo:<order_id>' — provisionne l'instance d'une commande.
+
+    Robuste au redémarrage : on ne dépend PAS d'un cache mémoire. Le token
+    contient l'order_id ; on relit la commande depuis WooCommerce à la volée.
+    """
     query = update.callback_query
-    await query.answer()
+    await query.answer()  # accuse réception du clic (stoppe le "chargement")
     if not is_admin(update):
-        await query.edit_message_text("⛔ Réservé aux admins.")
+        await query.answer("⛔ Réservé aux admins.", show_alert=True)
         return
 
-    _, token = query.data.split(":", 1)
-    wctx = context.bot_data.get("woo_ctx", {}).get(token)
-    if not wctx:
-        await query.edit_message_text("⚠️ Cette commande n'est plus en attente.")
+    try:
+        _, token = query.data.split(":", 1)
+        order_id = int(token)
+    except (ValueError, IndexError):
+        await query.answer("Donnée de bouton invalide.", show_alert=True)
         return
 
     db: Database = context.bot_data["db"]
-    order_id = wctx["order_id"]
+    woo: Optional[WooConnector] = context.bot_data.get("woo")
 
-    # Idempotence : refuser si déjà provisionnée
+    if woo is None:
+        await _safe_edit(query, "⚠️ WooCommerce n'est pas configuré.")
+        return
+
+    # Idempotence : refuser si déjà provisionnée (job actif ou réussi)
     existing = db.job_for_woo_order(order_id)
     if existing:
-        await query.edit_message_text(
-            f"⚠️ Commande #{wctx['number']} déjà provisionnée (job #{existing}).")
+        await _safe_edit(
+            query,
+            f"⚠️ Commande #{order_id} déjà provisionnée (job #{existing}).\n"
+            f"Pour redéployer, supprime d'abord l'instance : /delete {existing}")
         return
 
-    pack = PACKS.get(wctx["pack_key"])
-    if not pack or not pack["deploy_key_uuid"]:
-        await query.edit_message_text(
-            f"⚠️ Pack `{wctx['pack_key']}` indisponible (deploy key manquante).")
+    # Relire la commande depuis WooCommerce (source de vérité, survit au restart)
+    try:
+        order = woo.get_order(order_id)
+    except WooNotFound:
+        await _safe_edit(query, f"⚠️ Commande #{order_id} introuvable côté WooCommerce.")
+        return
+    except (WooAuthError, WooError) as e:
+        await _safe_edit(query, f"🔴 Erreur WooCommerce : {e}")
         return
 
-    name = wctx["client_name"]
-    domain = f"{wctx['subdomain']}.{DOMAIN_SUFFIX}"
-    app_name = f"jgh-{name}-{wctx['pack_key']}-{int(time.time())}"
+    # Vérifier que le pack est déployable
+    if not order.pack_key:
+        await _safe_edit(
+            query,
+            f"⚠️ Commande #{order_id} : produit {order.product_id} non mappé "
+            f"à un pack. Déploiement impossible.")
+        return
+
+    pack = PACKS.get(order.pack_key)
+    if not pack or not pack.get("deploy_key_uuid"):
+        await _safe_edit(
+            query,
+            f"⚠️ Pack `{order.pack_key}` pas encore déployable "
+            f"(deploy key manquante).")
+        return
+
+    # Construire les paramètres de déploiement
+    subdomain = order.resolved_subdomain()
+    name = subdomain
+    domain = f"{subdomain}.{DOMAIN_SUFFIX}"
+    app_name = f"jgh-{name}-{order.pack_key}-{int(time.time())}"
 
     # Créer le job lié à la commande WooCommerce (instance_type=client)
     idem = f"woo:{order_id}"
@@ -1040,18 +1073,35 @@ async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idempotency_key=idem, instance_type="client",
         woo_order_id=order_id)
 
-    context.bot_data["woo_ctx"].pop(token, None)
+    # Nettoyer le cache mémoire si présent (best effort)
+    context.bot_data.get("woo_ctx", {}).pop(token, None)
 
-    await query.edit_message_text(
-        f"⏳ Déploiement de la commande #{wctx['number']} (job #{job_id})…\n"
-        f"Pack `{wctx['pack_key']}` · `{domain}`",
-        parse_mode="Markdown")
+    await _safe_edit(
+        query,
+        f"⏳ Déploiement de la commande #{order.number} (job #{job_id})…\n"
+        f"Pack `{order.pack_key}` · `{domain}`")
 
     # Réutiliser la logique de déploiement + suivi
     await _launch_deployment(
         context, job_id=job_id, app_name=app_name,
         deploy_key_uuid=pack["deploy_key_uuid"],
         service=pack["service"], chat_id=query.message.chat_id)
+
+
+async def _safe_edit(query, text: str):
+    """Édite le message d'un callback, avec repli si l'édition échoue.
+
+    edit_message_text peut échouer (message trop vieux, déjà modifié,
+    identique). Dans ce cas on envoie un nouveau message pour que l'admin
+    voie toujours le retour.
+    """
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown")
+    except Exception:
+        try:
+            await query.message.reply_text(text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("Impossible d'afficher le retour du callback : %s", e)
 
 
 async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
