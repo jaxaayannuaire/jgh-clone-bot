@@ -31,7 +31,7 @@ ENV/
 # --- Artefacts de packs (produits par publish_pack.py, ne pas versionner) ---
 pack-*-v*/
 *.sql
-!db/schema.sql
+!db/*.sql
 custom_*.tar.gz
 documents_*.tar.gz
 pack_*.tar.gz
