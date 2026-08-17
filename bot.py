@@ -79,6 +79,17 @@ DOMAIN_SUFFIX = os.environ.get("DOMAIN_SUFFIX", "51.255.204.248.sslip.io")
 # Les UUID de deploy key viennent du .env (un par pack) pour ne pas coder de
 # secret/identifiant d'infra en dur dans le code versionné.
 
+def _int_or_none(val: str) -> Optional[int]:
+    """Convertit une chaîne .env en int, ou None si vide/invalide."""
+    val = (val or "").strip()
+    if not val:
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None
+
+
 PACKS: dict[str, dict] = {
     "pos": {
         "label": "Pack POS (Tambali + TakePOS)",
@@ -87,16 +98,60 @@ PACKS: dict[str, dict] = {
             "git@github.com:jaxaayannuaire/jgh-pack-pos.git"),
         "branch": os.environ.get("PACK_POS_BRANCH", "main"),
         "deploy_key_uuid": os.environ.get("PACK_POS_DEPLOY_KEY_UUID", ""),
+        "product_id": _int_or_none(os.environ.get("PACK_POS_PRODUCT_ID", "")),
         "service": "dolib",
         "version": "1.0.0",
     },
-    # "tambali": { ... },
-    # "asso":    { ... },
-    # "pro":     { ... },
-    # "immo":    { ... },
+    "tambali": {
+        "label": "Pack Tambali",
+        "repo": os.environ.get("PACK_TAMBALI_REPOSITORY",
+                               "git@github.com:jaxaayannuaire/jgh-pack-tambali.git"),
+        "branch": os.environ.get("PACK_TAMBALI_BRANCH", "main"),
+        "deploy_key_uuid": os.environ.get("PACK_TAMBALI_DEPLOY_KEY_UUID", ""),
+        "product_id": _int_or_none(os.environ.get("PACK_TAMBALI_PRODUCT_ID", "")),
+        "service": "dolib",
+        "version": "1.0.0",
+    },
+    "asso": {
+        "label": "Pack Asso",
+        "repo": os.environ.get("PACK_ASSO_REPOSITORY",
+                               "git@github.com:jaxaayannuaire/jgh-pack-asso.git"),
+        "branch": os.environ.get("PACK_ASSO_BRANCH", "main"),
+        "deploy_key_uuid": os.environ.get("PACK_ASSO_DEPLOY_KEY_UUID", ""),
+        "product_id": _int_or_none(os.environ.get("PACK_ASSO_PRODUCT_ID", "")),
+        "service": "dolib",
+        "version": "1.0.0",
+    },
+    "pro": {
+        "label": "Pack Pro",
+        "repo": os.environ.get("PACK_PRO_REPOSITORY",
+                               "git@github.com:jaxaayannuaire/jgh-pack-pro.git"),
+        "branch": os.environ.get("PACK_PRO_BRANCH", "main"),
+        "deploy_key_uuid": os.environ.get("PACK_PRO_DEPLOY_KEY_UUID", ""),
+        "product_id": _int_or_none(os.environ.get("PACK_PRO_PRODUCT_ID", "")),
+        "service": "dolib",
+        "version": "1.0.0",
+    },
 }
 
 DEFAULT_PACK = os.environ.get("DEFAULT_PACK", "pos")
+
+
+def pack_is_deployable(pack_key: str) -> bool:
+    """Un pack est déployable s'il a une deploy key configurée."""
+    p = PACKS.get(pack_key)
+    return bool(p and p.get("deploy_key_uuid"))
+
+
+def build_product_mapping() -> dict[int, str]:
+    """Construit le mapping product_id WooCommerce -> clé de pack depuis le
+    catalogue (product_id lu du .env). Ignore les packs sans product_id."""
+    mapping: dict[int, str] = {}
+    for key, p in PACKS.items():
+        pid = p.get("product_id")
+        if pid:
+            mapping[pid] = key
+    return mapping
 
 # --- Suivi de déploiement (notification de fin) ---
 # Intervalle entre deux vérifications de l'état du déploiement.
@@ -145,7 +200,7 @@ def build_woo_connector() -> Optional[WooConnector]:
         base_url=base, consumer_key=key, consumer_secret=secret,
         timeout=int(os.environ.get("WOO_TIMEOUT", "30")),
     )
-    return WooConnector(cfg)
+    return WooConnector(cfg, product_mapping=build_product_mapping())
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +907,15 @@ async def cmd_commandes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"provisionnées ({already}).")
         return
 
+    # Trier par numéro de commande décroissant (les plus récentes d'abord).
+    # On trie sur l'entier du n° quand c'est possible, sinon sur l'order_id.
+    def _order_sort_key(o):
+        try:
+            return int(o.number)
+        except (ValueError, TypeError):
+            return o.order_id or 0
+    to_do.sort(key=_order_sort_key, reverse=True)
+
     # Afficher chaque commande à traiter avec un bouton "Déployer"
     header = (f"🛒 *{len(to_do)} commande(s) à provisionner*"
               f"{f' ({already} déjà faite(s))' if already else ''}\n")
@@ -859,19 +923,27 @@ async def cmd_commandes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.bot_data.setdefault("woo_ctx", {})
     for o in to_do:
-        pack_txt = (f"`{o.pack_key}`" if o.pack_key
-                    else f"⚠️ produit {o.product_id} non mappé")
         sd = o.resolved_subdomain()
+        deployable = o.pack_key and pack_is_deployable(o.pack_key)
+
+        if o.pack_key:
+            pack_txt = f"`{o.pack_key}`"
+            if not deployable:
+                pack_txt += " (pas encore déployable)"
+        else:
+            pack_txt = f"⚠️ produit {o.product_id} non mappé"
+
         card = (
-            f"*Commande #{o.number}*\n"
+            f"*Commande #{o.number}* · {o.date_label()}\n"
             f"Client : {o.client_label()}\n"
             f"Tél : `{o.phone or '—'}` · {o.email or '—'}\n"
             f"Produit : {o.product_name} → {pack_txt}\n"
             f"Sous-domaine : `{sd}`\n"
             f"Montant : {o.total} {o.currency}"
         )
-        # On ne propose le bouton que si le pack est mappé
-        if o.pack_key:
+
+        # Bouton Déployer UNIQUEMENT si le pack est mappé ET déployable
+        if deployable:
             token = f"{o.order_id}"
             context.bot_data["woo_ctx"][token] = {
                 "order_id": o.order_id, "number": o.number,
@@ -884,9 +956,15 @@ async def cmd_commandes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]])
             await update.message.reply_text(card, reply_markup=kb,
                                             parse_mode="Markdown")
-        else:
+        elif o.pack_key:
+            # Pack reconnu mais pas encore déployable (deploy key absente)
             await update.message.reply_text(
-                card + "\n\n⚠️ Pack non reconnu — vérifier le mapping produit.",
+                card + "\n\n⏳ Ce pack n'est pas encore prêt au déploiement.",
+                parse_mode="Markdown")
+        else:
+            # Produit non mappé (pas un pack) — avertissement conservé
+            await update.message.reply_text(
+                card + "\n\n⚠️ Produit hors catalogue de packs (non déployable).",
                 parse_mode="Markdown")
 
 

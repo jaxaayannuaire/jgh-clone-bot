@@ -47,15 +47,19 @@ class WooNotFound(WooError):
 # ---------------------------------------------------------------------------
 # Mapping produit WooCommerce -> clé de pack du catalogue
 # ---------------------------------------------------------------------------
-# IDs produits confirmés sur yessalerp.com. Étendre ici si de nouveaux packs
-# sont ajoutés au catalogue commercial.
+# Le mapping réel est injecté par le bot au moment de la construction
+# (depuis le catalogue PACKS, lui-même alimenté par le .env :
+# PACK_<X>_PRODUCT_ID). Ce dict par défaut sert de repli / documentation.
 
-PRODUCT_TO_PACK: dict[int, str] = {
+DEFAULT_PRODUCT_TO_PACK: dict[int, str] = {
     3508: "tambali",
     3562: "pos",
     3566: "asso",
     3581: "pro",
 }
+
+# Alias rétro-compat (certains imports peuvent l'utiliser)
+PRODUCT_TO_PACK = DEFAULT_PRODUCT_TO_PACK
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +133,15 @@ class WooOrder:
             return f"{name} — {self.activite}" if name else self.activite
         return name or f"Client #{self.order_id}"
 
+    def date_label(self) -> str:
+        """Date + heure lisibles de la commande (depuis date_created ISO)."""
+        raw = self.date_created or ""
+        # Format ISO WooCommerce : '2026-08-16T09:59:24'
+        if "T" in raw:
+            date_part, _, time_part = raw.partition("T")
+            return f"{date_part} {time_part[:5]}"  # AAAA-MM-JJ HH:MM
+        return raw or "—"
+
 
 def _slug(text: str) -> str:
     """Normalise un texte en slug de sous-domaine (lettres/chiffres, minuscules)."""
@@ -148,8 +161,14 @@ def _slug(text: str) -> str:
 class WooConnector:
     """Client mince de l'API REST WooCommerce (lecture)."""
 
-    def __init__(self, config: WooConfig):
+    def __init__(self, config: WooConfig,
+                 product_mapping: Optional[dict[int, str]] = None):
         self.cfg = config
+        # Mapping product_id -> pack_key. Injecté par le bot depuis le catalogue
+        # (.env). Repli sur le mapping par défaut si non fourni.
+        self.product_mapping = (product_mapping
+                                if product_mapping is not None
+                                else DEFAULT_PRODUCT_TO_PACK)
         self._session = self._build_session()
 
     def _build_session(self) -> requests.Session:
@@ -207,8 +226,8 @@ class WooConnector:
     def list_orders(self, status: str = "completed",
                     per_page: int = 20) -> list[WooOrder]:
         """
-        Liste les commandes d'un statut donné (défaut 'completed'), les plus
-        récentes d'abord, normalisées en WooOrder.
+        Liste les commandes d'un statut donné (défaut 'completed'), normalisées,
+        triées par NUMÉRO de commande décroissant (les plus récentes d'abord).
         """
         data = self._request("GET", "orders", params={
             "status": status,
@@ -218,7 +237,15 @@ class WooConnector:
         })
         if not isinstance(data, list):
             return []
-        return [self._parse_order(o) for o in data]
+        orders = [self._parse_order(o) for o in data]
+        # Tri décroissant par numéro de commande (numérique si possible)
+        def _num_key(o: WooOrder):
+            try:
+                return int(o.number)
+            except (ValueError, TypeError):
+                return -1
+        orders.sort(key=_num_key, reverse=True)
+        return orders
 
     def get_order(self, order_id: int) -> WooOrder:
         """Détail d'une commande, normalisée."""
@@ -233,8 +260,7 @@ class WooConnector:
 
     # -- Parsing défensif ---------------------------------------------------
 
-    @staticmethod
-    def _parse_order(o: dict) -> WooOrder:
+    def _parse_order(self, o: dict) -> WooOrder:
         billing = o.get("billing", {}) or {}
 
         # Premier produit de la commande (un pack = une ligne en général)
@@ -250,7 +276,7 @@ class WooConnector:
                 for m in (o.get("meta_data") or [])
                 if isinstance(m, dict)}
 
-        pack_key = PRODUCT_TO_PACK.get(product_id) if product_id else None
+        pack_key = self.product_mapping.get(product_id) if product_id else None
 
         return WooOrder(
             order_id=o.get("id"),

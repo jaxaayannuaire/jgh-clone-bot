@@ -25,6 +25,16 @@ Intégration WooCommerce (lecture) : provisionner depuis les commandes.
 - Schéma DuckDB : colonne `woo_order_id` (migration douce).
 - `create_job` et `get_job` gèrent le lien vers la commande WooCommerce.
 
+### Changed (suite)
+- Mapping produit -> pack désormais configurable via le `.env`
+  (`PACK_<X>_PRODUCT_ID`), centralisé avec le reste de la définition du pack
+  (repo, deploy key). Plus de mapping en dur.
+- `/commandes` : tri par n° de commande décroissant, date + heure affichées.
+- Bouton « Déployer » affiché uniquement pour les packs déployables
+  (deploy key présente) — POS seul aujourd'hui. Les packs mappés mais non
+  déployables et les produits hors catalogue restent listés avec un
+  avertissement (utile pour le nettoyage futur via l'API écriture).
+
 ### Notes
 - Étape 1 = LECTURE SEULE : le bot lit et provisionne. La validation d'une
   commande (passage à `completed`) et la création de commandes terrain
