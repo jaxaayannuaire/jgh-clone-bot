@@ -40,6 +40,12 @@ from woo_connector import (
     WooConnector, WooConfig, WooError, WooAuthError, WooNotFound,
     PRODUCT_TO_PACK,
 )
+from db.wizard_store import WizardStore
+from wizard_engine import Wizard
+from wizard_runtime import (
+    register_wizard, start_wizard, on_wizard_callback, on_wizard_text,
+    expire_sessions_job,
+)
 
 load_dotenv()
 
@@ -1165,6 +1171,93 @@ async def cmd_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Démarrage
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# WIZARD DE DÉMONSTRATION (Phase 1) — valide le moteur sans rien déployer.
+# ---------------------------------------------------------------------------
+
+def _wizard_slug(raw: str, data: dict) -> str:
+    """Normalise en slug (réutilise la logique des sous-domaines)."""
+    import unicodedata
+    raw = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode()
+    return "".join(c for c in raw.lower() if c.isalnum())[:30]
+
+
+def _wizard_validate_nom(value: str, data: dict):
+    if len(value) < 2:
+        return (False, "Le nom doit faire au moins 2 caractères.")
+    return (True, None)
+
+
+def _demo_summary(data: dict) -> str:
+    pack = data.get("pack", "?")
+    nom = data.get("nom", "?")
+    return (f"Pack : `{pack}`\n"
+            f"Nom : `{nom}`\n"
+            f"Domaine (fictif) : `{nom}.demo.local`")
+
+
+async def _demo_execute(data: dict, ctx: dict):
+    """Exécution du wizard démo : n'effectue AUCUN déploiement réel.
+    Affiche simplement les données validées (test du moteur)."""
+    context = ctx["context"]
+    chat_id = ctx["chat_id"]
+    await context.bot.send_message(
+        chat_id,
+        f"🧪 *Démo terminée* (aucun déploiement réel)\n\n"
+        f"Données collectées et validées :\n"
+        f"• Pack : `{data.get('pack')}`\n"
+        f"• Nom : `{data.get('nom')}`\n\n"
+        f"Le moteur wizard fonctionne ✅",
+        parse_mode="Markdown")
+
+
+WIZARD_DEMO = Wizard(
+    type="demo",
+    title="Démo — assistant de test",
+    intro="🧭 Ceci est une démonstration du nouvel assistant guidé. "
+          "Aucune instance ne sera déployée.",
+    steps=[
+        {
+            "key": "pack", "type": "choice",
+            "question": "Quel pack veux-tu (fictivement) déployer ?",
+            "options": lambda d: [
+                {"label": PACKS[k]["label"], "value": k} for k in PACKS
+            ],
+            "default": DEFAULT_PACK,
+            "edit_label": "Pack",
+        },
+        {
+            "key": "nom", "type": "text",
+            "question": "Quel nom pour l'instance ?\n"
+                        "_(lettres et chiffres ; sera normalisé)_",
+            "validate": _wizard_validate_nom,
+            "transform": _wizard_slug,
+            "edit_label": "Nom",
+        },
+        {"key": "_confirm", "type": "confirm", "summary": _demo_summary},
+    ],
+    execute=_demo_execute,
+)
+
+
+async def cmd_demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/demo — lance le wizard de démonstration (test du moteur)."""
+    if not is_allowed(update):
+        return
+    await start_wizard(update, context, "demo")
+
+
+async def on_text_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler texte unifié. Priorité au wizard (si une session texte est active),
+    sinon on retombe sur la saisie du nom de suppression (mode admin direct).
+    """
+    consumed = await on_wizard_text(update, context)
+    if consumed:
+        return
+    await on_delete_name_reply(update, context)
+
+
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     db = Database(os.environ.get("DB_PATH", "clone.duckdb"))
@@ -1175,6 +1268,11 @@ def main():
     app.bot_data["db"] = db
     app.bot_data["coolify"] = coolify
     app.bot_data["woo"] = woo
+    # Store des sessions wizard (réutilise la connexion DuckDB du bot).
+    app.bot_data["wizard_store"] = WizardStore(
+        db._con, ttl_minutes=int(os.environ.get("WIZARD_TTL_MIN", "15")))
+    # Enregistrer les wizards disponibles.
+    register_wizard(WIZARD_DEMO)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("version", cmd_version))
@@ -1186,14 +1284,21 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("job", cmd_job))
+    app.add_handler(CommandHandler("demo", cmd_demo))
     # Callbacks : provision (ok/no), suppression test (del1/delno, del2)
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^(ok|no):"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^(del1|delno):"))
     app.add_handler(CallbackQueryHandler(on_delete_execute, pattern=r"^del2:"))
     app.add_handler(CallbackQueryHandler(on_woo_provision, pattern=r"^woo:"))
-    # Saisie du nom pour la suppression CLIENT (texte hors commande)
+    # Callbacks du moteur wizard.
+    app.add_handler(CallbackQueryHandler(on_wizard_callback, pattern=r"^wiz:"))
+    # Saisie texte : priorité au wizard, repli sur la suppression par nom.
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, on_delete_name_reply))
+        filters.TEXT & ~filters.COMMAND, on_text_dispatch))
+
+    # Tâche périodique : expirer les sessions wizard abandonnées.
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(expire_sessions_job, interval=300, first=300)
 
     # Garde-fou : le suivi de déploiement repose sur job_queue, qui n'existe
     # que si python-telegram-bot est installé avec l'extra [job-queue].

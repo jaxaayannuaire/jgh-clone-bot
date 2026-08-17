@@ -3,6 +3,32 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.6.0] - 2026-08-17
+
+Moteur d'assistant guidé (wizard) — Phase 1 (fondations).
+
+### Added
+- **Moteur conversationnel générique** (`wizard_engine.py`) : exécute des
+  assistants multi-étapes définis de façon déclarative (étapes de type choix,
+  saisie, confirmation). Une commande = une intention ; paramètres demandés
+  progressivement ; boutons quand possible ; valeurs par défaut ; validation
+  immédiate ; récapitulatif avant toute écriture ; VALIDER = seule action qui
+  exécute ; ANNULER = aucune modification.
+- **Persistance des sessions** (`db/wizard_store.py`, table `wizard_sessions`) :
+  état en base DuckDB, survit au redémarrage, expiration des sessions
+  abandonnées (15 min), anti-double-validation atomique, base d'audit.
+- **Runtime Telegram** (`wizard_runtime.py`) : démarrage, reprise/abandon d'une
+  session en cours, navigation (retour, modifier un champ, annuler), rendu sur
+  un fil de message unique, capture des saisies texte.
+- Commande `/demo` : assistant de démonstration (3 étapes) qui valide le moteur
+  sans déployer quoi que ce soit.
+- Tâche périodique d'expiration des sessions abandonnées.
+
+### Notes
+- Phase 1 = fondations + démo. Les fonctionnalités réelles (déploiement,
+  suppression, validation de commande) seront migrées vers le wizard en
+  Phase 2+. Le mode admin actuel (commandes directes) reste disponible.
+
 ## [0.5.3] - 2026-08-17
 
 Correctif : double-clic sur « Déployer » créant des jobs fantômes.
