@@ -637,30 +637,172 @@ async def poll_deployment(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_instances(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/instances — liste les instances déployées avec type, statut, mise en ligne."""
+    """/instances — navigateur liste→détail des instances déployées."""
     if not is_allowed(update):
         return
+    await _instances_show_list(update, context, page=1, edit=False)
+
+
+# --- États d'instance : libellés ---
+_INSTANCE_STATUS = {
+    "active": "🟢 en ligne", "running": "⏳ en cours",
+    "failed": "🔴 échec", "deleted": "🗑️ supprimée",
+}
+
+
+def _instance_body(it: dict) -> str:
+    """Bloc d'infos d'une instance dans la liste (style Alert Bot)."""
+    badge = "🧪" if it["instance_type"] == "test" else "👤"
+    etat = _INSTANCE_STATUS.get(it["status"], it["status"])
+    return (f"{badge} `{it['client_name']}` — {etat}\n"
+            f"   🌐 `{it['subdomain']}`")
+
+
+async def _instances_show_list(update_or_query, context, page: int, edit: bool):
+    """Affiche la page de liste des instances."""
+    from ui_render import ListItem, build_list_screen, paginate
+
     db: Database = context.bot_data["db"]
-    instances = db.list_instances(30)
+    instances = db.list_instances(100)
     if not instances:
-        await update.message.reply_text("Aucune instance déployée.")
+        msg = "📦 Aucune instance déployée pour le moment."
+        if edit:
+            await update_or_query.edit_message_text(msg)
+        else:
+            await update_or_query.message.reply_text(msg)
         return
 
-    status_icons = {"active": "🟢 en ligne", "running": "⏳ en cours",
-                    "failed": "🔴 échec", "deleted": "🗑️ supprimée"}
-    lines = ["*Instances déployées*\n"]
-    for it in instances:
-        type_badge = "🧪" if it["instance_type"] == "test" else "👤"
-        etat = status_icons.get(it["status"], it["status"])
-        # Date de mise en ligne (online_at), sinon création
-        when = it["online_at"] or it["created_at"]
-        when_str = str(when)[:16] if when else "—"
-        lines.append(
-            f"{type_badge} #{it['id']} `{it['client_name']}` — {etat}\n"
-            f"   `{it['subdomain']}`\n"
-            f"   en ligne : {when_str}")
-    lines.append("\nSupprimer : /delete <id>")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    page_items, page, total_pages = paginate(instances, page)
+    items = []
+    for idx, it in enumerate(page_items, start=1):
+        items.append(ListItem(
+            number=(page - 1) * 10 + idx,
+            short_label=it["client_name"][:14],
+            body=_instance_body(it),
+            value=str(it["id"]),
+        ))
+
+    screen = build_list_screen(
+        title="Instances", icon="📦", total=len(instances),
+        page=page, total_pages=total_pages, items=items,
+        detail_prefix="inst:detail", nav_prefix="inst:nav")
+
+    markup = _screen_to_markup(screen)
+    if edit:
+        await _safe_edit_markup(update_or_query, screen.text, markup)
+    else:
+        await update_or_query.message.reply_text(
+            screen.text, reply_markup=markup, parse_mode="Markdown")
+
+
+async def _instances_show_detail(query, context, job_id: int):
+    """Affiche le détail d'une instance avec ses actions."""
+    from ui_render import build_detail_screen
+
+    db: Database = context.bot_data["db"]
+    job = db.get_job(job_id)
+    if not job:
+        await _safe_edit_markup(query, "⚠️ Instance introuvable.", None)
+        return
+
+    badge = "🧪 Test" if job["instance_type"] == "test" else "👤 Client"
+    etat = _INSTANCE_STATUS.get(job["status"], job["status"])
+    when = job.get("online_at") or job.get("created_at")
+    when_str = str(when)[:16] if when else "—"
+    url = f"https://{job['subdomain']}/"
+
+    fields = [
+        ("🖥️ Nom", f"`{job['client_name']}`"),
+        ("🏷️ Type", badge),
+        ("🌐 Domaine", f"`{job['subdomain']}`"),
+        ("📶 État", etat),
+        ("🕒 En ligne", when_str),
+    ]
+    if job.get("woo_order_id"):
+        fields.append(("🛒 Commande", f"#{job['woo_order_id']}"))
+
+    # Actions contextuelles
+    actions = []
+    if job["status"] != "deleted":
+        actions.append({"label": "🔗 Ouvrir", "data": f"inst:act:open:{job_id}"})
+        actions.append({"label": "🗑️ Supprimer",
+                        "data": f"inst:act:delete:{job_id}"})
+    actions.append({"label": "📊 Job", "data": f"inst:act:job:{job_id}"})
+
+    screen = build_detail_screen(
+        title=job["client_name"], icon="📦", fields=fields,
+        actions=actions, nav_prefix="inst:nav")
+
+    await _safe_edit_markup(query, screen.text, _screen_to_markup(screen))
+
+
+async def on_instances_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Routage des callbacks 'inst:...' (navigation liste↔détail, actions)."""
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        return
+
+    parts = query.data.split(":")
+    # inst:detail:<id> | inst:nav:page:<n> | inst:nav:home | inst:nav:refresh
+    #                  | inst:nav:back    | inst:act:<action>:<id>
+    section = parts[1]
+
+    if section == "detail":
+        await _instances_show_detail(query, context, int(parts[2]))
+        return
+
+    if section == "nav":
+        sub = parts[2]
+        if sub == "page":
+            await _instances_show_list(query, context, int(parts[3]), edit=True)
+        elif sub in ("home", "back", "refresh"):
+            await _instances_show_list(query, context, page=1, edit=True)
+        return
+
+    if section == "act":
+        action, job_id = parts[2], int(parts[3])
+        db: Database = context.bot_data["db"]
+        job = db.get_job(job_id)
+        if not job:
+            await _safe_edit_markup(query, "⚠️ Instance introuvable.", None)
+            return
+
+        if action == "open":
+            await query.message.reply_text(
+                f"🔗 URL de l'instance :\nhttps://{job['subdomain']}/")
+        elif action == "job":
+            await query.message.reply_text(f"📊 Détails du job : /job {job_id}")
+        elif action == "delete":
+            # Renvoie vers le wizard de suppression (cohérence).
+            await query.message.reply_text(
+                f"🗑️ Pour supprimer cette instance en toute sécurité, "
+                f"utilise l'assistant : /supprimer")
+        return
+
+
+def _screen_to_markup(screen):
+    """Convertit un RenderedScreen (ui_render) en InlineKeyboardMarkup."""
+    if not screen.buttons:
+        return None
+    rows = []
+    for line in screen.buttons:
+        rows.append([InlineKeyboardButton(b["label"], callback_data=b["data"])
+                     for b in line])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _safe_edit_markup(query, text, markup):
+    """Édite un message avec repli si l'édition échoue."""
+    try:
+        await query.edit_message_text(text, reply_markup=markup,
+                                      parse_mode="Markdown")
+    except Exception:
+        try:
+            await query.message.reply_text(text, reply_markup=markup,
+                                           parse_mode="Markdown")
+        except Exception:
+            pass
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1632,6 +1774,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_woo_provision, pattern=r"^woo:"))
     # Callbacks du moteur wizard.
     app.add_handler(CallbackQueryHandler(on_wizard_callback, pattern=r"^wiz:"))
+    app.add_handler(CallbackQueryHandler(on_instances_nav, pattern=r"^inst:"))
     # Saisie texte : priorité au wizard, repli sur la suppression par nom.
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, on_text_dispatch))

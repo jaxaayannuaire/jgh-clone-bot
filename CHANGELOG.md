@@ -3,6 +3,24 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.9.0] - 2026-08-21
+
+Refonte `/instances` en navigateur liste→détail (style JGH Alert Bot).
+
+### Added
+- Module `ui_render.py` : helpers de rendu réutilisables (style Alert Bot) —
+  en-têtes avec icône, séparateurs, items numérotés, boutons 2 colonnes
+  « n • libellé », pagination (10/page), navigation commune (◀️ Retour,
+  🏠 Accueil, ♻️ Actualiser).
+- `/instances` refondu : écran LISTE paginé → clic sur une instance → écran
+  DÉTAIL (nom, type, domaine, état, date, commande liée) avec actions
+  contextuelles (🔗 Ouvrir, 🗑️ Supprimer, 📊 Job).
+- Le bouton 🗑️ Supprimer renvoie vers l'assistant `/supprimer` (cohérence).
+
+### Notes
+- Même paradigme que JGH Alert Bot, pour une expérience unifiée entre les deux
+  bots. `/commandes` sera refondu de la même façon ensuite, puis `/delete`
+  (mode direct) sera retiré.
 ## [0.8.1] - 2026-08-21
 
 Correctif : `/supprimer` plantait au démarrage.
