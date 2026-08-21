@@ -1247,6 +1247,159 @@ async def cmd_demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_wizard(update, context, "demo")
 
 
+# ---------------------------------------------------------------------------
+# WIZARD /deployer (Phase 2) — déploiement guidé d'une instance.
+# Réutilise _launch_deployment (même moteur que /provision et /commandes).
+# ---------------------------------------------------------------------------
+
+# Types d'instance proposés. Extensible plus tard (sandbox 24h, testadmin…).
+DEPLOY_TYPES = [
+    {"label": "👤 Client", "value": "client"},
+    {"label": "🧪 Test", "value": "test"},
+]
+
+
+def _deployer_packs_options(data: dict) -> list:
+    """Options de packs : uniquement ceux qui sont déployables (deploy key)."""
+    opts = []
+    for k, p in PACKS.items():
+        if p.get("deploy_key_uuid"):
+            opts.append({"label": p["label"], "value": k})
+    return opts
+
+
+def _deployer_domain_default(data: dict) -> str:
+    """Domaine par défaut dérivé du nom saisi."""
+    nom = data.get("nom", "")
+    return f"{nom}.{DOMAIN_SUFFIX}" if nom else ""
+
+
+def _deployer_domain_question(data: dict) -> str:
+    nom = data.get("nom", "")
+    propose = f"{nom}.{DOMAIN_SUFFIX}" if nom else "(nom manquant)"
+    return (f"Quel domaine pour l'instance ?\n\n"
+            f"Par défaut : `{propose}`\n"
+            f"_Laisse vide et appuie sur « Passer » pour utiliser ce domaine, "
+            f"ou saisis un domaine personnalisé._")
+
+
+def _deployer_summary(data: dict) -> str:
+    pack_key = data.get("pack", "?")
+    pack = PACKS.get(pack_key, {})
+    nom = data.get("nom", "?")
+    type_val = data.get("type", "client")
+    type_badge = "🧪 TEST" if type_val == "test" else "👤 CLIENT"
+    domain = data.get("domaine") or f"{nom}.{DOMAIN_SUFFIX}"
+    return (
+        f"Type : {type_badge}\n"
+        f"Client : `{nom}`\n"
+        f"Pack : `{pack_key}` — {pack.get('label', '?')} "
+        f"v{pack.get('version', '?')}\n"
+        f"Domaine : `{domain}`\n"
+        f"Repo : `{pack.get('repo', '?')}`\n\n"
+        f"⚠️ La validation lance le déploiement Coolify réel."
+    )
+
+
+async def _deployer_execute(data: dict, ctx: dict):
+    """Exécution du wizard /deployer : déploiement RÉEL via _launch_deployment."""
+    context = ctx["context"]
+    chat_id = ctx["chat_id"]
+    db: Database = context.bot_data["db"]
+
+    pack_key = data.get("pack")
+    pack = PACKS.get(pack_key)
+    nom = data.get("nom")
+    type_val = data.get("type", "client")
+    domain = data.get("domaine") or f"{nom}.{DOMAIN_SUFFIX}"
+
+    # Garde-fous (au cas où l'état serait incohérent)
+    if not pack or not pack.get("deploy_key_uuid"):
+        await context.bot.send_message(
+            chat_id, f"⚠️ Pack `{pack_key}` non déployable. Abandon.",
+            parse_mode="Markdown")
+        return
+
+    app_name = f"jgh-{nom}-{pack_key}-{int(time.time())}"
+
+    # Idempotence : même nom/pack/domaine ne relance pas un doublon.
+    idem = f"provision:{nom}:{pack_key}:{domain}"
+    existing = db.job_exists_for_key(idem)
+    if existing:
+        await context.bot.send_message(
+            chat_id,
+            f"⚠️ Un job existe déjà pour ce nom/pack/domaine (job #{existing}).\n"
+            f"Voir /job {existing}. Change le nom pour un nouveau déploiement.",
+            parse_mode="Markdown")
+        return
+
+    job_id = db.create_job(
+        client_name=nom, subdomain=domain,
+        git_repository=pack["repo"], git_branch=pack["branch"],
+        idempotency_key=idem, instance_type=type_val)
+
+    await context.bot.send_message(
+        chat_id,
+        f"⏳ Déploiement en cours (job #{job_id})…\n"
+        f"Pack `{pack_key}` · `{domain}`",
+        parse_mode="Markdown")
+
+    await _launch_deployment(
+        context, job_id=job_id, app_name=app_name,
+        deploy_key_uuid=pack["deploy_key_uuid"],
+        service=pack["service"], chat_id=chat_id)
+
+
+WIZARD_DEPLOYER = Wizard(
+    type="deployer",
+    title="Déploiement d'une instance",
+    intro="🚀 Assistant de déploiement guidé.",
+    steps=[
+        {
+            "key": "type", "type": "choice",
+            "question": "Quel type d'instance ?",
+            "options": DEPLOY_TYPES,
+            "default": "client",
+            "edit_label": "Type",
+        },
+        {
+            "key": "pack", "type": "choice",
+            "question": "Quel pack déployer ?",
+            "options": _deployer_packs_options,
+            "default": DEFAULT_PACK,
+            "edit_label": "Pack",
+        },
+        {
+            "key": "nom", "type": "text",
+            "question": "Quel nom pour l'instance / le client ?\n"
+                        "_(lettres et chiffres ; sera normalisé)_",
+            "validate": _wizard_validate_nom,
+            "transform": _wizard_slug,
+            "edit_label": "Nom",
+        },
+        {
+            "key": "domaine", "type": "text",
+            "question": _deployer_domain_question,
+            "optional": True,
+            "default_from": _deployer_domain_default,
+            "edit_label": "Domaine",
+        },
+        {"key": "_confirm", "type": "confirm", "summary": _deployer_summary},
+    ],
+    execute=_deployer_execute,
+)
+
+
+async def cmd_deployer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/deployer — assistant guidé de déploiement d'une instance."""
+    if not is_allowed(update):
+        return
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Réservé aux admins.")
+        return
+    await start_wizard(update, context, "deployer")
+
+
 async def on_text_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handler texte unifié. Priorité au wizard (si une session texte est active),
@@ -1273,6 +1426,7 @@ def main():
         db._con, ttl_minutes=int(os.environ.get("WIZARD_TTL_MIN", "15")))
     # Enregistrer les wizards disponibles.
     register_wizard(WIZARD_DEMO)
+    register_wizard(WIZARD_DEPLOYER)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("version", cmd_version))
@@ -1285,6 +1439,7 @@ def main():
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("job", cmd_job))
     app.add_handler(CommandHandler("demo", cmd_demo))
+    app.add_handler(CommandHandler("deployer", cmd_deployer))
     # Callbacks : provision (ok/no), suppression test (del1/delno, del2)
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^(ok|no):"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^(del1|delno):"))

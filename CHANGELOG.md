@@ -3,6 +3,25 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.7.0] - 2026-08-19
+
+Wizard Phase 2 — déploiement guidé (`/deployer`).
+
+### Added
+- Commande `/deployer` : assistant guidé de déploiement d'une instance, basé
+  sur le moteur wizard. Étapes : type (client/test) → pack → nom → domaine
+  (auto-dérivé, personnalisable) → récapitulatif → VALIDER.
+- Le wizard réutilise `_launch_deployment` (même moteur de déploiement que
+  `/provision` et `/commandes`) : aucune duplication de logique.
+- Seuls les packs déployables (avec deploy key) sont proposés.
+- Idempotence conservée (même nom/pack/domaine ne relance pas un doublon).
+
+### Notes
+- `/provision` (mode admin expert, arguments en ligne) reste disponible en
+  parallèle. `/deployer` est le mode guidé, accessible sans connaître la syntaxe.
+- Le récapitulatif du wizard remplace l'ancienne confirmation ✅/❌ de
+  `/provision` (une seule confirmation, native au wizard).
+
 ## [0.6.0] - 2026-08-17
 
 Moteur d'assistant guidé (wizard) — Phase 1 (fondations).
