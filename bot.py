@@ -1566,9 +1566,21 @@ async def cmd_supprimer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Aucune instance active à supprimer. Voir /instances.")
         return
 
-    # Injecter la liste des instances dans la session (pour les boutons).
+    # Ne conserver que les champs utiles au wizard (pas les datetime, qui ne
+    # sont pas sérialisables en JSON pour la persistance de session).
+    slim = [
+        {
+            "id": i["id"],
+            "client_name": i["client_name"],
+            "subdomain": i["subdomain"],
+            "instance_type": i["instance_type"],
+        }
+        for i in instances
+    ]
+
+    # Injecter la liste (allégée) des instances dans la session (pour boutons).
     await start_wizard(update, context, "supprimer",
-                       initial_data={"_instances": instances})
+                       initial_data={"_instances": slim})
 
 
 async def on_text_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -117,7 +117,7 @@ class WizardStore:
         """
         session_id = self._con.execute(
             "SELECT nextval('seq_wizard_sessions')").fetchone()[0]
-        data_json = json.dumps(initial_data) if initial_data else '{}'
+        data_json = json.dumps(initial_data, default=str) if initial_data else '{}'
         self._con.execute(
             """INSERT INTO wizard_sessions
                (id, user_id, chat_id, wizard_type, current_step, step_index,
@@ -145,7 +145,7 @@ class WizardStore:
                SET collected_data = ?, updated_at = current_timestamp,
                    expires_at = ?
                WHERE id = ?""",
-            [json.dumps(data), self._expiry(), session_id])
+            [json.dumps(data, default=str), self._expiry(), session_id])
 
     def goto_step(self, session_id: int, step_key: str, step_index: int):
         """Positionne la session sur une étape donnée et prolonge l'expiration."""

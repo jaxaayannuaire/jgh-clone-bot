@@ -3,6 +3,20 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.8.1] - 2026-08-21
+
+Correctif : `/supprimer` plantait au démarrage.
+
+### Fixed
+- `cmd_supprimer` injectait les instances brutes (avec des champs datetime
+  `online_at`/`created_at`) dans la session wizard ; la sérialisation JSON de
+  la session échouait (`Object of type datetime is not JSON serializable`),
+  rendant `/supprimer` muet. Correctifs :
+  - la commande n'injecte plus que les champs utiles (id, nom, sous-domaine,
+    type), sans les dates ;
+  - le store sérialise désormais avec `default=str` (robuste à tout type non
+    JSON, défense en profondeur).
+
 ## [0.8.0] - 2026-08-19
 
 Wizard Phase 2 (suite) — suppression guidée (`/supprimer`).
