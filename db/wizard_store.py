@@ -108,17 +108,23 @@ class WizardStore:
         }
 
     def create_session(self, user_id: int, chat_id: int,
-                        wizard_type: str, first_step: str) -> int:
-        """Crée une session active. Renvoie son id."""
+                        wizard_type: str, first_step: str,
+                        initial_data: Optional[dict] = None) -> int:
+        """Crée une session active. Renvoie son id.
+
+        initial_data : données pré-remplies (ex. contexte injecté par la
+        commande, comme une liste d'options calculée au démarrage).
+        """
         session_id = self._con.execute(
             "SELECT nextval('seq_wizard_sessions')").fetchone()[0]
+        data_json = json.dumps(initial_data) if initial_data else '{}'
         self._con.execute(
             """INSERT INTO wizard_sessions
                (id, user_id, chat_id, wizard_type, current_step, step_index,
                 collected_data, status, expires_at)
-               VALUES (?, ?, ?, ?, ?, 0, '{}', 'active', ?)""",
+               VALUES (?, ?, ?, ?, ?, 0, ?, 'active', ?)""",
             [session_id, user_id, chat_id, wizard_type, first_step,
-             self._expiry()])
+             data_json, self._expiry()])
         return session_id
 
     def set_message_id(self, session_id: int, message_id: int):

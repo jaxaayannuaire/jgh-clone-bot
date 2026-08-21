@@ -3,6 +3,34 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.8.0] - 2026-08-19
+
+Wizard Phase 2 (suite) — suppression guidée (`/supprimer`).
+
+### Added
+- Commande `/supprimer` : assistant guidé de suppression d'une instance.
+  Liste les instances actives en boutons (plus sûr que de taper un id).
+  Réutilise `_do_delete` (même moteur que `/delete`).
+- Confirmation renforcée pour les instances CLIENT : retaper le nom exact
+  (Option B). Les instances TEST vont directement au récapitulatif.
+- Garde-fous re-vérifiés au moment de l'exécution (déploiement en cours,
+  déjà supprimée, pas d'app Coolify).
+
+### Wizard engine — nouvelles capacités (rétrocompatibles)
+- `initial_data` : injecter un contexte pré-rempli au démarrage d'un wizard
+  (ex. liste d'instances pour les boutons).
+- `skip_if(data)` sur une étape : étapes conditionnelles (ex. sauter la
+  confirmation par nom pour les tests).
+- `on_answer(value, data)` sur une étape choice : enrichir les données après
+  un choix (ex. résoudre le type/nom/domaine de l'instance choisie).
+
+### Notes
+- `/delete` (mode admin direct) reste disponible en parallèle, le temps que
+  `/supprimer` soit éprouvé.
+- Modes de suppression avancés prévus pour plus tard (partielle avec archivage
+  Drive/OVH, résiliation avec livraison au client) — l'étape « Mode » pourra
+  être ajoutée sans refonte.
+
 ## [0.7.0] - 2026-08-19
 
 Wizard Phase 2 — déploiement guidé (`/deployer`).

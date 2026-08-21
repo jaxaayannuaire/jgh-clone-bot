@@ -72,8 +72,12 @@ async def _render(context, chat_id: int, session_id: int, view: WizardView,
 # ---------------------------------------------------------------------------
 
 async def start_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                       wizard_type: str):
-    """Point d'entrée d'une commande /xxx qui lance un wizard."""
+                       wizard_type: str, initial_data: dict = None):
+    """Point d'entrée d'une commande /xxx qui lance un wizard.
+
+    initial_data : contexte pré-rempli (ex. liste d'options calculée par la
+    commande au démarrage). Stocké dans la session dès sa création.
+    """
     store = context.bot_data["wizard_store"]
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -100,15 +104,17 @@ async def start_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE,
             reply_markup=kb, parse_mode="Markdown")
         return
 
-    await _begin_new_session(context, chat_id, user_id, wizard, store)
+    await _begin_new_session(context, chat_id, user_id, wizard, store,
+                             initial_data=initial_data)
 
 
 async def _begin_new_session(context, chat_id, user_id, wizard, store,
-                             reply_to=None):
+                             reply_to=None, initial_data=None):
     first_step = wizard.steps[0]
     session_id = store.create_session(
-        user_id, chat_id, wizard.type, first_step["key"])
-    view = build_step_view(wizard, 0, session_id, {})
+        user_id, chat_id, wizard.type, first_step["key"],
+        initial_data=initial_data)
+    view = build_step_view(wizard, 0, session_id, initial_data or {})
     markup = _to_markup(view)
     intro = (wizard.intro + "\n\n") if wizard.intro else ""
     msg = await context.bot.send_message(
@@ -189,6 +195,17 @@ async def on_wizard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "choose":
         step_key, value = extra[0], extra[1]
         store.save_answer(session_id, step_key, value)
+        # Hook optionnel on_answer : permet à l'étape d'enrichir les données
+        # (ex. résoudre l'instance choisie → stocker son type/nom/domaine).
+        step = wizard.step_by_index(sess["step_index"])
+        on_answer = step.get("on_answer") if step else None
+        if on_answer:
+            # Recharger data avec la réponse fraîche
+            fresh = store.get_session(session_id)["collected_data"]
+            enrich = on_answer(value, fresh)
+            if enrich:
+                for k, v in enrich.items():
+                    store.save_answer(session_id, k, v)
         await _advance(context, query, wizard, session_id, store)
         return
 
@@ -300,12 +317,28 @@ async def on_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Navigation interne
 # ---------------------------------------------------------------------------
 
+def _next_visible_index(wizard, from_index: int, data: dict) -> int:
+    """Renvoie l'index de la prochaine étape VISIBLE à partir de from_index.
+
+    Une étape est sautée si elle définit skip_if(data) -> True. Permet des
+    étapes conditionnelles (ex. confirmation par nom seulement pour les
+    clients). S'arrête au dernier index si tout est sauté."""
+    idx = from_index
+    while idx < len(wizard.steps):
+        step = wizard.steps[idx]
+        skip_if = step.get("skip_if")
+        if skip_if and skip_if(data):
+            idx += 1
+            continue
+        return idx
+    return len(wizard.steps) - 1
+
+
 async def _advance(context, query, wizard, session_id, store):
-    """Avance à l'étape suivante après un clic (choice/skip)."""
+    """Avance à l'étape suivante VISIBLE après un clic (choice/skip)."""
     sess = store.get_session(session_id)
-    next_index = sess["step_index"] + 1
-    if next_index >= len(wizard.steps):
-        next_index = len(wizard.steps) - 1
+    next_index = _next_visible_index(
+        wizard, sess["step_index"] + 1, sess["collected_data"])
     step = wizard.step_by_index(next_index)
     store.goto_step(session_id, step["key"], next_index)
     view = build_step_view(wizard, next_index, session_id,
@@ -318,8 +351,7 @@ async def _advance_from_text(context, update, wizard, session_id, store,
                              next_index):
     """Avance après une saisie texte (nouveau message, pas d'édition)."""
     sess = store.get_session(session_id)
-    if next_index >= len(wizard.steps):
-        next_index = len(wizard.steps) - 1
+    next_index = _next_visible_index(wizard, next_index, sess["collected_data"])
     step = wizard.step_by_index(next_index)
     store.goto_step(session_id, step["key"], next_index)
     view = build_step_view(wizard, next_index, session_id,

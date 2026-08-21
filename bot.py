@@ -1400,6 +1400,177 @@ async def cmd_deployer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_wizard(update, context, "deployer")
 
 
+# ---------------------------------------------------------------------------
+# WIZARD /supprimer (Phase 2) — suppression guidée d'une instance.
+# Réutilise _do_delete (même moteur que /delete). Liste les instances en
+# boutons (plus sûr que de taper un id). Confirmation renforcée pour les
+# instances CLIENT (retaper le nom exact — Option B).
+#
+# Prévu pour accueillir plus tard d'autres MODES de suppression :
+#   - suppression totale (implémentée)
+#   - suppression partielle avec archivage (Drive/OVH) [futur]
+#   - résiliation avec livraison au client [futur]
+# ---------------------------------------------------------------------------
+
+def _supprimer_instances_options(data: dict) -> list:
+    """Liste les instances actives (non supprimées) comme options de boutons.
+
+    La valeur encodée est l'id du job ; le label montre type + nom + domaine.
+    Les instances sont injectées via initial_data au démarrage du wizard."""
+    instances = data.get("_instances", [])
+    opts = []
+    for inst in instances:
+        badge = "🧪" if inst["instance_type"] == "test" else "👤"
+        opts.append({
+            "label": f"{badge} {inst['client_name']} ({inst['subdomain']})",
+            "value": str(inst["id"]),
+        })
+    return opts
+
+
+def _supprimer_on_instance_chosen(value: str, data: dict) -> dict:
+    """Hook on_answer : à partir de l'id d'instance choisi, enrichit la session
+    avec le type/nom/domaine (pour la suite du wizard)."""
+    instances = data.get("_instances", [])
+    for inst in instances:
+        if str(inst["id"]) == str(value):
+            return {
+                "_selected_type": inst["instance_type"],
+                "_selected_name": inst["client_name"],
+                "_selected_domain": inst["subdomain"],
+            }
+    return {}
+
+
+def _supprimer_skip_name(data: dict) -> bool:
+    """Saute l'étape de confirmation par nom si l'instance n'est PAS un client
+    (les tests n'exigent pas de retaper le nom)."""
+    return data.get("_selected_type") != "client"
+
+
+def _supprimer_name_question(data: dict) -> str:
+    nom = data.get("_selected_name", "?")
+    return (f"⚠️ Suppression d'une instance *CLIENT*.\n\n"
+            f"Pour confirmer, retape exactement le nom de l'instance :\n"
+            f"`{nom}`")
+
+
+def _supprimer_validate_name(value: str, data: dict):
+    """Vérifie que le nom retapé correspond exactement à l'instance choisie."""
+    expected = data.get("_selected_name", "")
+    if value.strip() != expected:
+        return (False, f"Le nom ne correspond pas. Attendu : {expected}")
+    return (True, None)
+
+
+def _supprimer_summary(data: dict) -> str:
+    nom = data.get("_selected_name", "?")
+    domain = data.get("_selected_domain", "?")
+    itype = data.get("_selected_type", "client")
+    badge = "🧪 TEST" if itype == "test" else "👤 CLIENT"
+    return (
+        f"Instance : `{nom}`\n"
+        f"Type : {badge}\n"
+        f"Domaine : `{domain}`\n"
+        f"Mode : suppression totale (app + données)\n\n"
+        f"⚠️ Cette action est *irréversible*. L'application Coolify et "
+        f"toutes ses données (volumes) seront supprimées définitivement."
+    )
+
+
+async def _supprimer_execute(data: dict, ctx: dict):
+    """Exécution du wizard /supprimer : suppression RÉELLE via _do_delete."""
+    context = ctx["context"]
+    chat_id = ctx["chat_id"]
+    db: Database = context.bot_data["db"]
+
+    job_id = int(data.get("instance"))
+    job = db.get_job(job_id)
+    if not job:
+        await context.bot.send_message(chat_id, f"⚠️ Job #{job_id} introuvable.")
+        return
+
+    # Re-vérifier les garde-fous au moment de l'exécution (l'état a pu changer)
+    if job["status"] == "deleted":
+        await context.bot.send_message(
+            chat_id, f"⚠️ L'instance #{job_id} est déjà supprimée.")
+        return
+    if job["status"] in ("running", "confirmed", "pending"):
+        await context.bot.send_message(
+            chat_id,
+            f"⚠️ Le déploiement #{job_id} est encore en cours. "
+            f"Suppression annulée.")
+        return
+    if not job.get("coolify_app_uuid"):
+        await context.bot.send_message(
+            chat_id, f"⚠️ Le job #{job_id} n'a pas d'application Coolify.")
+        return
+
+    dctx = {
+        "job_id": job_id,
+        "app_uuid": job["coolify_app_uuid"],
+        "name": job["client_name"],
+        "domain": job["subdomain"],
+    }
+    # _do_delete gère la suppression Coolify + base + notification.
+    # On passe un update minimal : _do_delete envoie via chat_id (edit=False).
+    class _FakeMessage:
+        @staticmethod
+        async def reply_text(txt, parse_mode=None):
+            await context.bot.send_message(chat_id, txt, parse_mode=parse_mode)
+
+    class _FakeUpdate:
+        callback_query = None
+        message = _FakeMessage()
+
+    await _do_delete(_FakeUpdate(), context, dctx, edit=False)
+
+
+WIZARD_SUPPRIMER = Wizard(
+    type="supprimer",
+    title="Suppression d'une instance",
+    intro="🗑️ Assistant de suppression guidé.",
+    steps=[
+        {
+            "key": "instance", "type": "choice",
+            "question": "Quelle instance veux-tu supprimer ?",
+            "options": _supprimer_instances_options,
+            "on_answer": _supprimer_on_instance_chosen,
+            "edit_label": "Instance",
+        },
+        {
+            "key": "confirm_name", "type": "text",
+            "question": _supprimer_name_question,
+            "validate": _supprimer_validate_name,
+            "skip_if": _supprimer_skip_name,   # sauté pour les tests
+            "edit_label": "Confirmation nom",
+        },
+        {"key": "_confirm", "type": "confirm", "summary": _supprimer_summary},
+    ],
+    execute=_supprimer_execute,
+)
+
+
+async def cmd_supprimer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/supprimer — assistant guidé de suppression d'une instance."""
+    if not is_allowed(update):
+        return
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Réservé aux admins.")
+        return
+
+    db: Database = context.bot_data["db"]
+    instances = db.list_instances(include_deleted=False)
+    if not instances:
+        await update.message.reply_text(
+            "Aucune instance active à supprimer. Voir /instances.")
+        return
+
+    # Injecter la liste des instances dans la session (pour les boutons).
+    await start_wizard(update, context, "supprimer",
+                       initial_data={"_instances": instances})
+
+
 async def on_text_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handler texte unifié. Priorité au wizard (si une session texte est active),
@@ -1427,6 +1598,7 @@ def main():
     # Enregistrer les wizards disponibles.
     register_wizard(WIZARD_DEMO)
     register_wizard(WIZARD_DEPLOYER)
+    register_wizard(WIZARD_SUPPRIMER)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("version", cmd_version))
@@ -1440,6 +1612,7 @@ def main():
     app.add_handler(CommandHandler("job", cmd_job))
     app.add_handler(CommandHandler("demo", cmd_demo))
     app.add_handler(CommandHandler("deployer", cmd_deployer))
+    app.add_handler(CommandHandler("supprimer", cmd_supprimer))
     # Callbacks : provision (ok/no), suppression test (del1/delno, del2)
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^(ok|no):"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^(del1|delno):"))
