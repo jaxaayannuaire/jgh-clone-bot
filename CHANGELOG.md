@@ -3,6 +3,29 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.10.0] - 2026-08-21
+
+Refonte `/commandes` en navigateur liste→détail (même style que /instances).
+
+### Added
+- `/commandes` refondu : écran LISTE paginé des commandes WooCommerce
+  'completed' à provisionner → clic sur une commande → écran DÉTAIL (numéro,
+  date, client, tél, email, produit/pack, sous-domaine, montant) avec actions
+  contextuelles.
+- Actions du détail : 🚀 Déployer (si le pack est déployable), ✅ Terminer
+  (affiche « bientôt disponible » — nécessite l'écriture WooCommerce, Étape 2
+  à venir).
+- Badges dans la liste : 🚀 déployable, ⏳ pack pas encore prêt, ⚠️ produit non
+  mappé.
+
+### Changed
+- Logique de provisioning factorisée (`_woo_provision_order`), partagée entre
+  l'ancien callback `woo:<id>` (compatibilité) et le nouveau bouton 🚀 Déployer
+  du détail — aucune duplication.
+
+### Notes
+- Le bouton ✅ Terminer sera branché quand l'écriture WooCommerce (validation
+  de commande) sera implémentée.
 ## [0.9.2] - 2026-08-21
 
 Ajustements de design `/instances` (retours terrain).

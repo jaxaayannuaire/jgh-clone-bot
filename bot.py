@@ -1070,132 +1070,200 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_commandes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/commandes — liste les commandes WooCommerce 'completed' à provisionner."""
+    """/commandes — navigateur liste→détail des commandes WooCommerce."""
     if not is_allowed(update):
         return
     if not is_admin(update):
         await update.message.reply_text("⛔ Réservé aux admins.")
         return
+    await _commandes_show_list(update, context, page=1, edit=False)
 
+
+def _commande_order_sort_key(o):
+    try:
+        return int(o.number)
+    except (ValueError, TypeError):
+        return o.order_id or 0
+
+
+async def _commandes_fetch(context) -> Optional[list]:
+    """Lit les commandes WooCommerce 'completed' non encore provisionnées.
+    Renvoie None si WooCommerce n'est pas configuré ou en erreur (le message
+    d'erreur a déjà été envoyé)."""
     woo: Optional[WooConnector] = context.bot_data.get("woo")
     if woo is None:
-        await update.message.reply_text(
-            "⚠️ WooCommerce n'est pas configuré (clés API absentes du .env).")
-        return
-
+        return None
     db: Database = context.bot_data["db"]
+    orders = woo.list_orders(status="completed", per_page=20)
+    to_do = [o for o in orders if not db.job_for_woo_order(o.order_id)]
+    to_do.sort(key=_commande_order_sort_key, reverse=True)
+    return to_do
 
-    await update.message.reply_text("🔎 Lecture des commandes WooCommerce…")
+
+def _commande_body(o) -> str:
+    """Bloc d'infos d'une commande dans la liste (style Alert Bot)."""
+    deployable = o.pack_key and pack_is_deployable(o.pack_key)
+    if o.pack_key:
+        badge = "🚀" if deployable else "⏳"
+        pack_txt = f"{o.pack_key}" + ("" if deployable else " (pas prêt)")
+    else:
+        badge = "⚠️"
+        pack_txt = f"produit {o.product_id} non mappé"
+    return (f"{badge} *Commande #{o.number}* — {o.client_label()}\n"
+            f"📦 {pack_txt} · 💰 {o.total} {o.currency}")
+
+
+async def _commandes_show_list(update_or_query, context, page: int, edit: bool):
+    """Affiche la page de liste des commandes à provisionner."""
+    from ui_render import ListItem, build_list_screen, paginate
+
+    async def _send(msg):
+        if edit:
+            await _safe_edit_markup(update_or_query, msg, None)
+        else:
+            await update_or_query.message.reply_text(msg)
 
     try:
-        orders = woo.list_orders(status="completed", per_page=20)
+        to_do = await _commandes_fetch(context)
     except WooAuthError as e:
-        await update.message.reply_text(f"🔴 Auth WooCommerce refusée : {e}")
+        await _send(f"🔴 Auth WooCommerce refusée : {e}")
         return
     except WooError as e:
-        await update.message.reply_text(f"🔴 Erreur WooCommerce : {e}")
+        await _send(f"🔴 Erreur WooCommerce : {e}")
         return
 
-    if not orders:
-        await update.message.reply_text(
-            "Aucune commande *completed* à traiter.", parse_mode="Markdown")
+    if to_do is None:
+        await _send("⚠️ WooCommerce n'est pas configuré (clés API absentes).")
         return
-
-    # Séparer : à provisionner (pas encore de job) vs déjà fait
-    to_do = []
-    already = 0
-    for o in orders:
-        if db.job_for_woo_order(o.order_id):
-            already += 1
-        else:
-            to_do.append(o)
-
     if not to_do:
-        await update.message.reply_text(
-            f"✅ Toutes les commandes completed récentes sont déjà "
-            f"provisionnées ({already}).")
+        await _send("✅ Aucune commande à provisionner pour le moment.")
         return
 
-    # Trier par numéro de commande décroissant (les plus récentes d'abord).
-    # On trie sur l'entier du n° quand c'est possible, sinon sur l'order_id.
-    def _order_sort_key(o):
+    # Contexte pour le détail (évite de relire WooCommerce à chaque clic)
+    context.bot_data["commandes_cache"] = {str(o.order_id): o for o in to_do}
+
+    page_items, page, total_pages = paginate(to_do, page)
+    items = []
+    for idx, o in enumerate(page_items, start=1):
+        items.append(ListItem(
+            number=(page - 1) * 10 + idx,
+            short_label=f"#{o.number}",
+            body=_commande_body(o),
+            value=str(o.order_id),
+        ))
+
+    screen = build_list_screen(
+        title="Commandes", icon="🛒", total=len(to_do),
+        page=page, total_pages=total_pages, items=items,
+        detail_prefix="cmd:detail", nav_prefix="cmd:nav")
+
+    markup = _screen_to_markup(screen)
+    if edit:
+        await _safe_edit_markup(update_or_query, screen.text, markup)
+    else:
+        await update_or_query.message.reply_text(
+            screen.text, reply_markup=markup, parse_mode="Markdown")
+
+
+async def _commandes_show_detail(query, context, order_id: int):
+    """Affiche le détail d'une commande avec ses actions."""
+    from ui_render import build_detail_screen
+
+    cache = context.bot_data.get("commandes_cache", {})
+    o = cache.get(str(order_id))
+    if o is None:
+        # Cache expiré (redémarrage) : relire depuis WooCommerce
+        woo: Optional[WooConnector] = context.bot_data.get("woo")
+        if woo is None:
+            await _safe_edit_markup(query, "⚠️ WooCommerce non configuré.", None)
+            return
         try:
-            return int(o.number)
-        except (ValueError, TypeError):
-            return o.order_id or 0
-    to_do.sort(key=_order_sort_key, reverse=True)
+            o = woo.get_order(order_id)
+        except (WooNotFound, WooError) as e:
+            await _safe_edit_markup(query, f"⚠️ Commande introuvable : {e}", None)
+            return
 
-    # Afficher chaque commande à traiter avec un bouton "Déployer"
-    header = (f"🛒 *{len(to_do)} commande(s) à provisionner*"
-              f"{f' ({already} déjà faite(s))' if already else ''}\n")
-    await update.message.reply_text(header, parse_mode="Markdown")
+    deployable = o.pack_key and pack_is_deployable(o.pack_key)
+    sd = o.resolved_subdomain()
 
-    context.bot_data.setdefault("woo_ctx", {})
-    for o in to_do:
-        sd = o.resolved_subdomain()
-        deployable = o.pack_key and pack_is_deployable(o.pack_key)
+    fields = [
+        ("🛒 Commande", f"*#{o.number}*"),
+        ("📅 Date", o.date_label()),
+        ("👤 Client", o.client_label()),
+        ("📞 Tél", f"`{o.phone or '—'}`"),
+        ("✉️ Email", o.email or "—"),
+        ("📦 Produit", f"{o.product_name} → `{o.pack_key or '—'}`"),
+        ("🌐 Sous-domaine", f"`{sd}`"),
+        ("💰 Montant", f"{o.total} {o.currency}"),
+    ]
 
-        if o.pack_key:
-            pack_txt = f"`{o.pack_key}`"
-            if not deployable:
-                pack_txt += " (pas encore déployable)"
-        else:
-            pack_txt = f"⚠️ produit {o.product_id} non mappé"
+    actions = []
+    if deployable:
+        actions.append({"label": "🚀 Déployer",
+                        "data": f"cmd:act:deploy:{order_id}"})
+    actions.append({"label": "✅ Terminer",
+                    "data": f"cmd:act:complete:{order_id}"})
 
-        card = (
-            f"*Commande #{o.number}* · {o.date_label()}\n"
-            f"Client : {o.client_label()}\n"
-            f"Tél : `{o.phone or '—'}` · {o.email or '—'}\n"
-            f"Produit : {o.product_name} → {pack_txt}\n"
-            f"Sous-domaine : `{sd}`\n"
-            f"Montant : {o.total} {o.currency}"
-        )
+    footer = None
+    if not o.pack_key:
+        footer = f"⚠️ Produit hors catalogue de packs (non déployable)."
+    elif not deployable:
+        footer = f"⏳ Pack `{o.pack_key}` pas encore prêt au déploiement."
 
-        # Bouton Déployer UNIQUEMENT si le pack est mappé ET déployable
-        if deployable:
-            token = f"{o.order_id}"
-            context.bot_data["woo_ctx"][token] = {
-                "order_id": o.order_id, "number": o.number,
-                "pack_key": o.pack_key, "subdomain": sd,
-                "client_name": sd,  # le nom d'instance = le sous-domaine
-            }
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🚀 Déployer",
-                                     callback_data=f"woo:{token}"),
-            ]])
-            await update.message.reply_text(card, reply_markup=kb,
-                                            parse_mode="Markdown")
-        elif o.pack_key:
-            # Pack reconnu mais pas encore déployable (deploy key absente)
-            await update.message.reply_text(
-                card + "\n\n⏳ Ce pack n'est pas encore prêt au déploiement.",
-                parse_mode="Markdown")
-        else:
-            # Produit non mappé (pas un pack) — avertissement conservé
-            await update.message.reply_text(
-                card + "\n\n⚠️ Produit hors catalogue de packs (non déployable).",
-                parse_mode="Markdown")
+    screen = build_detail_screen(
+        title=f"Commande #{o.number}", icon="🛒", fields=fields,
+        actions=actions, nav_prefix="cmd:nav", footer=footer)
+
+    await _safe_edit_markup(query, screen.text, _screen_to_markup(screen))
 
 
-async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback 'woo:<order_id>' — provisionne l'instance d'une commande.
-
-    Robuste au redémarrage : on ne dépend PAS d'un cache mémoire. Le token
-    contient l'order_id ; on relit la commande depuis WooCommerce à la volée.
-    """
+async def on_commandes_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Routage des callbacks 'cmd:...' (navigation liste↔détail, actions)."""
     query = update.callback_query
-    await query.answer()  # accuse réception du clic (stoppe le "chargement")
-    if not is_admin(update):
+    await query.answer()
+    if not is_allowed(update) or not is_admin(update):
         await query.answer("⛔ Réservé aux admins.", show_alert=True)
         return
 
-    try:
-        _, token = query.data.split(":", 1)
-        order_id = int(token)
-    except (ValueError, IndexError):
-        await query.answer("Donnée de bouton invalide.", show_alert=True)
+    parts = query.data.split(":")
+    section = parts[1]
+
+    if section == "detail":
+        await _commandes_show_detail(query, context, int(parts[2]))
         return
 
+    if section == "nav":
+        sub = parts[2]
+        if sub == "page":
+            await _commandes_show_list(query, context, int(parts[3]), edit=True)
+        elif sub in ("home", "back", "refresh"):
+            await _commandes_show_list(query, context, page=1, edit=True)
+        return
+
+    if section == "act":
+        action, order_id = parts[2], int(parts[3])
+
+        if action == "deploy":
+            # Réutilise le flux existant on_woo_provision (relit la commande
+            # depuis WooCommerce, réservation atomique, lance le déploiement).
+            await _woo_provision_order(query, context, order_id)
+            return
+
+        if action == "complete":
+            # Marquer 'completed' côté WooCommerce (Étape 2 - écriture) :
+            # pas encore implémenté (nécessite l'API d'écriture WooCommerce).
+            await query.answer(
+                "✅ Fonction « Terminer » bientôt disponible "
+                "(nécessite l'écriture WooCommerce).", show_alert=True)
+            return
+
+
+async def _woo_provision_order(query, context, order_id: int):
+    """Cœur du provisioning d'une commande WooCommerce (partagé par le
+    callback historique 'woo:<id>' et le bouton 🚀 Déployer de /commandes).
+
+    Robuste au redémarrage : relit la commande depuis WooCommerce à la volée
+    (pas de dépendance à un cache mémoire)."""
     db: Database = context.bot_data["db"]
     woo: Optional[WooConnector] = context.bot_data.get("woo")
 
@@ -1204,17 +1272,14 @@ async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Idempotence + anti-double-clic : réservation atomique de la commande.
-    # Si un job actif existe déjà, on ne crée rien (évite les jobs fantômes
-    # créés par des clics multiples).
     existing = db.job_for_woo_order(order_id)
     if existing:
         await _safe_edit(
             query,
             f"⚠️ Commande #{order_id} déjà en cours ou déployée (job #{existing}).\n"
-            f"Pour redéployer, supprime d'abord l'instance : /delete {existing}")
+            f"Pour redéployer, supprime d'abord l'instance : /supprimer")
         return
 
-    # Relire la commande depuis WooCommerce (source de vérité, survit au restart)
     try:
         order = woo.get_order(order_id)
     except WooNotFound:
@@ -1224,7 +1289,6 @@ async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(query, f"🔴 Erreur WooCommerce : {e}")
         return
 
-    # Vérifier que le pack est déployable
     if not order.pack_key:
         await _safe_edit(
             query,
@@ -1240,20 +1304,16 @@ async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"(deploy key manquante).")
         return
 
-    # Construire les paramètres de déploiement
     subdomain = order.resolved_subdomain()
     name = subdomain
     domain = f"{subdomain}.{DOMAIN_SUFFIX}"
     app_name = f"jgh-{name}-{order.pack_key}-{int(time.time())}"
 
-    # RÉSERVATION ATOMIQUE : crée le job seulement si aucun job actif n'existe.
-    # Protège contre le double-clic (deux clics rapprochés ne créent qu'un job).
     created_id, existing_id = db.try_claim_woo_order(
         woo_order_id=order_id, client_name=name, subdomain=domain,
         git_repository=pack["repo"], git_branch=pack["branch"])
 
     if existing_id is not None:
-        # Un autre clic a déjà réservé cette commande entre-temps.
         await _safe_edit(
             query,
             f"⚠️ Commande #{order_id} déjà prise en charge (job #{existing_id}). "
@@ -1262,25 +1322,44 @@ async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     job_id = created_id
 
-    # Retirer le bouton du message d'origine (évite les reclics visuels)
+    # Retirer le clavier du message d'origine (évite les reclics visuels)
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-
-    # Nettoyer le cache mémoire si présent (best effort)
-    context.bot_data.get("woo_ctx", {}).pop(token, None)
+    context.bot_data.get("woo_ctx", {}).pop(str(order_id), None)
 
     await query.message.reply_text(
         f"⏳ Déploiement de la commande #{order.number} (job #{job_id})…\n"
         f"Pack `{order.pack_key}` · `{domain}`",
         parse_mode="Markdown")
 
-    # Réutiliser la logique de déploiement + suivi
     await _launch_deployment(
         context, job_id=job_id, app_name=app_name,
         deploy_key_uuid=pack["deploy_key_uuid"],
         service=pack["service"], chat_id=query.message.chat_id)
+
+
+async def on_woo_provision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback 'woo:<order_id>' — provisionne l'instance d'une commande.
+
+    Conservé pour compatibilité (anciens boutons déjà envoyés). Le nouveau
+    flux (/commandes → détail → 🚀 Déployer) utilise cmd:act:deploy directement.
+    """
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.answer("⛔ Réservé aux admins.", show_alert=True)
+        return
+
+    try:
+        _, token = query.data.split(":", 1)
+        order_id = int(token)
+    except (ValueError, IndexError):
+        await query.answer("Donnée de bouton invalide.", show_alert=True)
+        return
+
+    await _woo_provision_order(query, context, order_id)
 
 
 async def _safe_edit(query, text: str):
@@ -1811,6 +1890,7 @@ def main():
     # Callbacks du moteur wizard.
     app.add_handler(CallbackQueryHandler(on_wizard_callback, pattern=r"^wiz:"))
     app.add_handler(CallbackQueryHandler(on_instances_nav, pattern=r"^inst:"))
+    app.add_handler(CallbackQueryHandler(on_commandes_nav, pattern=r"^cmd:"))
     # Saisie texte : priorité au wizard, repli sur la suppression par nom.
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, on_text_dispatch))
