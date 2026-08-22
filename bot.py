@@ -650,12 +650,35 @@ _INSTANCE_STATUS = {
 }
 
 
+_MOIS_FR = ["", "janvier", "février", "mars", "avril", "mai", "juin",
+            "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+
+
+def _date_fr(value) -> str:
+    """Formate une date/datetime au format français : « 17 août 2026, 02:06 ».
+    Accepte un datetime, une chaîne ISO, ou None."""
+    if not value:
+        return "—"
+    try:
+        from datetime import datetime
+        if isinstance(value, str):
+            # DuckDB peut renvoyer 'YYYY-MM-DD HH:MM:SS(.ffffff)'
+            s = value.replace("T", " ")[:19]
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        else:
+            dt = value
+        return f"{dt.day} {_MOIS_FR[dt.month]} {dt.year}, {dt.hour:02d}:{dt.minute:02d}"
+    except Exception:
+        return str(value)[:16]
+
+
 def _instance_body(it: dict) -> str:
-    """Bloc d'infos d'une instance dans la liste (style Alert Bot)."""
+    """Bloc d'infos d'une instance dans la liste (style Alert Bot).
+    Titre (nom) en gras pour se démarquer."""
     badge = "🧪" if it["instance_type"] == "test" else "👤"
     etat = _INSTANCE_STATUS.get(it["status"], it["status"])
-    return (f"{badge} `{it['client_name']}` — {etat}\n"
-            f"   🌐 `{it['subdomain']}`")
+    return (f"{badge} *{it['client_name']}* — {etat}\n"
+            f"🌐 `{it['subdomain']}`")
 
 
 async def _instances_show_list(update_or_query, context, page: int, edit: bool):
@@ -708,11 +731,11 @@ async def _instances_show_detail(query, context, job_id: int):
     badge = "🧪 Test" if job["instance_type"] == "test" else "👤 Client"
     etat = _INSTANCE_STATUS.get(job["status"], job["status"])
     when = job.get("online_at") or job.get("created_at")
-    when_str = str(when)[:16] if when else "—"
+    when_str = _date_fr(when)
     url = f"https://{job['subdomain']}/"
 
     fields = [
-        ("🖥️ Nom", f"`{job['client_name']}`"),
+        ("🖥️ Nom", f"*{job['client_name']}*"),
         ("🏷️ Type", badge),
         ("🌐 Domaine", f"`{job['subdomain']}`"),
         ("📶 État", etat),
@@ -772,7 +795,9 @@ async def on_instances_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 f"🔗 URL de l'instance :\nhttps://{job['subdomain']}/")
         elif action == "job":
-            await query.message.reply_text(f"📊 Détails du job : /job {job_id}")
+            # Afficher directement le détail du job (pas de renvoi vers /job)
+            await query.message.reply_text(
+                _render_job_text(job), parse_mode="Markdown")
         elif action == "delete":
             # Renvoie vers le wizard de suppression (cohérence).
             await query.message.reply_text(
@@ -1285,6 +1310,21 @@ async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+def _render_job_text(job: dict) -> str:
+    """Rendu texte d'un job (réutilisé par /job et le bouton Job du détail)."""
+    txt = (
+        f"📊 *Job #{job['id']}* — {job['status']}\n"
+        f"🖥️ Nom : *{job['client_name']}*\n"
+        f"🌐 Domaine : `{job['subdomain']}`\n"
+        f"🔑 App UUID : `{job['coolify_app_uuid'] or '—'}`\n"
+    )
+    if job["error_message"]:
+        txt += f"⚠️ Erreur : {job['error_message']}\n"
+    if job["stdout_log"]:
+        txt += f"\nLog :\n```\n{job['stdout_log'][-600:]}\n```"
+    return txt
+
+
 async def cmd_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -1296,17 +1336,7 @@ async def cmd_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not job:
         await update.message.reply_text("Job introuvable.")
         return
-    txt = (
-        f"*Job #{job['id']}* — {job['status']}\n"
-        f"Nom : `{job['client_name']}`\n"
-        f"Domaine : `{job['subdomain']}`\n"
-        f"App UUID : `{job['coolify_app_uuid'] or '—'}`\n"
-    )
-    if job["error_message"]:
-        txt += f"Erreur : {job['error_message']}\n"
-    if job["stdout_log"]:
-        txt += f"\nLog :\n```\n{job['stdout_log'][-600:]}\n```"
-    await update.message.reply_text(txt, parse_mode="Markdown")
+    await update.message.reply_text(_render_job_text(job), parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------

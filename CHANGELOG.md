@@ -3,6 +3,21 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.9.1] - 2026-08-21
+
+Améliorations de design de `/instances`.
+
+### Changed
+- Séparateurs ramenés à ~42 caractères (au lieu de 60) — plus adapté au mobile.
+- Titres d'instances en gras (nom mis en évidence).
+- Dates au format français (« 17 août 2026, 02:06 ») via un helper `_date_fr`.
+- Texte plus aéré : ligne vide entre chaque bloc (liste et détail).
+- Bouton « 📊 Job » du détail : affiche directement le résultat du job
+  (rendu partagé avec /job via `_render_job_text`), au lieu de renvoyer vers
+  la commande /job.
+
+### Notes
+- Champ « déployé par » (WooCommerce, admin Telegram…) prévu pour plus tard.
 ## [0.9.0] - 2026-08-21
 
 Refonte `/instances` en navigateur liste→détail (style JGH Alert Bot).

@@ -19,9 +19,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-# Séparateur horizontal (60 tirets), signature visuelle du style Alert Bot.
-SEP = "—" * 30  # 30 em-dashes ≈ largeur agréable sur mobile
-SEP_THIN = "-" * 60
+# Séparateur horizontal, signature visuelle du style Alert Bot.
+SEP = "—" * 21  # ≈ 42 caractères de large (em-dash), aéré sur mobile
+SEP_THIN = "-" * 42
 
 PAGE_SIZE = 10  # lignes par page (demandé)
 
@@ -80,7 +80,8 @@ def build_list_screen(
         lines.append(f"*{it.number}.* {it.body}")
         lines.append(SEP)
 
-    text = "\n".join(lines)
+    # Aération : ligne vide entre chaque bloc (texte plus respirant)
+    text = "\n\n".join(lines)
 
     # Boutons détail : 2 colonnes « n • libellé »
     buttons = []
@@ -133,7 +134,13 @@ def build_detail_screen(
     if footer:
         lines.append(SEP)
         lines.append(footer)
-    text = "\n".join(lines)
+    # En-tête + séparateur collés, puis champs aérés
+    header = f"{icon} *{title}*\n{SEP}\n"
+    field_lines = [f"{label} : {value}" for label, value in fields]
+    body = "\n\n".join(field_lines)
+    text = header + "\n" + body
+    if footer:
+        text += f"\n\n{SEP}\n\n{footer}"
 
     buttons = []
     # Actions contextuelles, 2 par ligne
