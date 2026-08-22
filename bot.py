@@ -818,11 +818,17 @@ def _screen_to_markup(screen):
 
 
 async def _safe_edit_markup(query, text, markup):
-    """Édite un message avec repli si l'édition échoue."""
+    """Édite un message. Si l'édition échoue parce que le contenu est identique
+    (« message is not modified »), on ignore silencieusement (pas de nouveau
+    message). Pour les autres erreurs (message trop vieux), repli sur un
+    nouveau message."""
     try:
         await query.edit_message_text(text, reply_markup=markup,
                                       parse_mode="Markdown")
-    except Exception:
+    except Exception as e:
+        # Contenu identique → Telegram refuse l'édition : on ignore.
+        if "not modified" in str(e).lower():
+            return
         try:
             await query.message.reply_text(text, reply_markup=markup,
                                            parse_mode="Markdown")

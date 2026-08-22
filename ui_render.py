@@ -69,12 +69,10 @@ def build_list_screen(
       (→ '<nav_prefix>:page:<n>', '<nav_prefix>:home', '<nav_prefix>:refresh')
     - counts_header : bloc optionnel de compteurs par catégorie (multi-lignes)
     """
-    lines = [f"{icon} *{title}*", SEP]
+    lines = [f"{icon} *{title}* — {total} résultat(s) · Page {page}/{total_pages}",
+             SEP]
     if counts_header:
-        lines.append(counts_header)
-        lines.append(SEP)
-    lines.append(f"{total} résultat(s) — Page {page}/{total_pages}")
-    lines.append(SEP)
+        lines.insert(1, counts_header)
 
     for it in items:
         lines.append(f"*{it.number}.* {it.body}")

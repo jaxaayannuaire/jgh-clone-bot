@@ -3,6 +3,19 @@
 Toutes les évolutions notables du JGH Clone Bot.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 
+## [0.9.2] - 2026-08-21
+
+Ajustements de design `/instances` (retours terrain).
+
+### Changed
+- Compteur affiché sur la même ligne que le titre
+  (« 📦 Instances — 2 résultat(s) · Page 1/1 ») : supprime l'espacement
+  vertical excessif en tête de liste.
+
+### Fixed
+- Les boutons 🏠 Accueil / ♻️ Actualiser sur la liste ne créent plus un nouveau
+  message quand le contenu est identique : l'erreur Telegram « message is not
+  modified » est désormais ignorée silencieusement (édition en place).
 ## [0.9.1] - 2026-08-21
 
 Améliorations de design de `/instances`.
